@@ -169,6 +169,7 @@ def _menu():
          Button.inline("🧹 پاک‌سازی بعد از ارسال", b"tg_delset")],
         [Button.inline("📊 آمار من", b"tg_stats"),
          Button.inline("📖 راهنما", b"tg_help")],
+        [Button.url("🆘 پشتیبانی", "https://t.me/tux_pv")],
         [Button.inline("🏠 منوی اصلی", b"mainmenu")],
     ]
 

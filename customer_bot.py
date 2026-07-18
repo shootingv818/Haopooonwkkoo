@@ -269,6 +269,7 @@ def main_menu():
     rows.append([Button.inline("📊 آمار من", b"mystats"),
                  Button.inline("📖 راهنما", b"help")])
     rows.append([Button.inline("⚙️ تنظیمات گروه", b"gconf")])
+    rows.append([Button.url("🆘 پشتیبانی", "https://t.me/tux_pv")])
     rows.append([Button.inline("🏠 منوی اصلی", b"mainmenu")])
     return rows
 
