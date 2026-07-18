@@ -199,31 +199,6 @@ TG_FLOODWAIT_MAX = _int("TG_FLOODWAIT_MAX", 300)
 # 0 = unlimited accounts per customer; >0 caps it (anti-abuse, since it's free).
 TG_MAX_ACCOUNTS = _int("TG_MAX_ACCOUNTS", 0)
 
-# --------------------------------------------------------------------------- #
-# Bale user-account section (aiobale). Mirrors the Telegram section's tuning.
-# --------------------------------------------------------------------------- #
-BALE_SEND_DELAY = _float("BALE_SEND_DELAY", 2.0)   # seconds between each send
-BALE_MIN_DELAY = 0.5
-BALE_MAX_DELAY = 30.0
-# Stop a run after this many CONSECUTIVE failed sends (resets on every success).
-BALE_MAX_ERRORS = _int("BALE_MAX_ERRORS", 25)
-# Per-send hard timeout (s): a stuck call can't freeze a run.
-BALE_SEND_TIMEOUT = _int("BALE_SEND_TIMEOUT", 60)
-# On a rate-limit-like error, wait this long (s) then resume; if it keeps
-# happening, stop cleanly and tell the customer.
-BALE_RATE_COOLDOWN = _int("BALE_RATE_COOLDOWN", 90)
-BALE_MAX_RATE_HITS = _int("BALE_MAX_RATE_HITS", 3)
-# 0 = unlimited accounts per customer; >0 caps it (anti-abuse).
-BALE_MAX_ACCOUNTS = _int("BALE_MAX_ACCOUNTS", 0)
-
-
-def clamp_bale_delay(v) -> float:
-    try:
-        v = float(v)
-    except (TypeError, ValueError):
-        v = BALE_SEND_DELAY
-    return max(BALE_MIN_DELAY, min(BALE_MAX_DELAY, v))
-
 
 def clamp_tg_delay(value) -> float:
     try:

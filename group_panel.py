@@ -5,7 +5,7 @@ group_panel.py — the GROUP (Config) section of the customer bot.
 
 Lets a customer install the bot in their OWN Telegram group and drive sending
 from there. Fully decoupled (own handlers, own DB table group_config). NEVER
-touches the Rubika/Telegram/Bale send code beyond REUSING customer_bot.run_send
+touches the Rubika/Telegram send code beyond REUSING customer_bot.run_send
 through a reference passed into setup().
 
 Hard rule: NOTHING here may crash or freeze the customer bot. Every handler is
@@ -13,7 +13,7 @@ wrapped, every external call is guarded. A bug in the group panel must never
 take the bot offline.
 
 Wiring: customer_bot.amain() calls group_panel.setup(bot, run_send=run_send,
-state=..., tg_state=..., bale_state=...).
+state=..., tg_state=...).
 
 Behaviour:
   * The bot only acts in groups that exist in group_config (a customer's group).
@@ -51,7 +51,7 @@ _glogin: dict = {}
 # numeric telegram id(s) of the new admin(s).
 _gadmin: dict = {}
 
-# Rubika/Telegram/Bale modules (imported lazily in setup so import stays light)
+# Rubika/Telegram modules (imported lazily in setup so import stays light)
 rb = worker = account_conn = None
 
 LINE = logbus.LINE

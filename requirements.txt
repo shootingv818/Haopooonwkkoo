@@ -20,8 +20,3 @@ tzdata>=2024.1
 # PV image -> PDF export.
 reportlab>=4.0.0
 Pillow>=10.0.0
-
-
-# Bale section (aiobale — pinned; reverse-engineered, so keep the exact version
-# the panel was built/tested against).
-aiobale==0.1.5

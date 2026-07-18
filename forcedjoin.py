@@ -5,7 +5,7 @@ forcedjoin.py — shared "forced channel membership" gate.
 
 The owner configures required channels in the OWNER panel (stored in db via
 forced_channels). The CUSTOMER bot enforces membership before letting a user
-do anything (in every section's gate: Rubika / Telegram / Bale).
+do anything (in every section's gate: Rubika / Telegram).
 
 HARD REQUIREMENT: the CUSTOMER bot must be an ADMIN in each required channel,
 otherwise Telegram won't let it query a user's membership. If membership can't

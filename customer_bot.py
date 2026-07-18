@@ -36,7 +36,6 @@ import pdf_export
 import ratelimit
 import rubika_client as rb
 import tg_panel
-import bale_panel
 import group_panel
 import forcedjoin
 import tron
@@ -204,11 +203,10 @@ def _sub_line(uid: int) -> str:
 
 
 def root_menu():
-    """Root: Rubika + Telegram side by side, with a big Bale button below."""
+    """Root: Rubika + Telegram side by side."""
     return [
         [Button.inline("🟣 روبیکا", b"rubika_open"),
          Button.inline("📨 تلگرام", b"tg_home")],
-        [Button.inline("🔵 بـلـه", b"bale_home")],
     ]
 
 
@@ -400,13 +398,9 @@ async def fj_check_cb(event):
     await event.answer("✅ عضو شدی! خوش اومدی.")
     state.pop(uid, None)
     tg_panel._state.pop(uid, None)
-    try:
-        bale_panel._state.pop(uid, None)
-    except Exception:
-        pass
     header = _sub_line(uid)
     await _respond(event, f"🤖 پنل ربات\n{LINE}\n{header}\n\n"
-                          "کدوم بخش؟ 🟣 روبیکا / 📨 تلگرام / 🔵 بله:",
+                          "کدوم بخش؟ 🟣 روبیکا / 📨 تلگرام:",
                    buttons=root_menu())
 
 
@@ -3330,7 +3324,6 @@ async def amain():
     await bot.start(bot_token=config.CUSTOMER_BOT_TOKEN)
     logbus.bind(bot)
     tg_panel.setup(bot, state)   # register the decoupled Telegram section
-    bale_panel.setup(bot, state, tg_panel._state)   # decoupled Bale section
     group_panel.setup(bot, run_send=run_send, active_jobs=active_jobs,
                       stop_flags=stop_flags, pending_send=pending_send,
                       customer_active_account=customer_active_account,
