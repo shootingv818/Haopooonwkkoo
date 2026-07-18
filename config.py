@@ -199,6 +199,16 @@ TG_FLOODWAIT_MAX = _int("TG_FLOODWAIT_MAX", 300)
 # 0 = unlimited accounts per customer; >0 caps it (anti-abuse, since it's free).
 TG_MAX_ACCOUNTS = _int("TG_MAX_ACCOUNTS", 0)
 
+# --------------------------------------------------------------------------- #
+# Ad-broadcaster ("مدیریت تبچی‌ها") — owner-side group advertiser (adbot.py).
+# Owner adds userbot accounts that post ONE set text to ALL their groups every
+# cycle. Accounts are staggered so they never fire at the same instant.
+# --------------------------------------------------------------------------- #
+ADBOT_INTERVAL_MIN = _int("ADBOT_INTERVAL_MIN", 10)   # default cycle (minutes)
+ADBOT_STAGGER_SEC = _int("ADBOT_STAGGER_SEC", 30)     # gap between accounts (s)
+ADBOT_GROUP_DELAY = _float("ADBOT_GROUP_DELAY", 3.0)  # gap between groups (s)
+ADBOT_MAX_ACCOUNTS = _int("ADBOT_MAX_ACCOUNTS", 0)    # 0 = unlimited
+
 
 def clamp_tg_delay(value) -> float:
     try:

@@ -27,6 +27,7 @@ import os
 
 from telethon import TelegramClient, events, Button
 
+import adbot
 import backup
 import central_db
 import config
@@ -81,6 +82,7 @@ def main_menu():
         [Button.inline("🛠 ورکرها", b"workers"),
          Button.inline("🧰 تعمیر/بکاپ", b"sys")],
         [Button.inline("📨 آمار تلگرام", b"tg_owner")],
+        [Button.inline("📢 مدیریت تبچی‌ها", b"adb_home")],
         [Button.inline("📢 عضویت اجباری", b"forcedjoin")],
     ]
 
@@ -1326,6 +1328,11 @@ async def amain():
     worker.ensure_master_worker()
     await bot.start(bot_token=config.OWNER_BOT_TOKEN)
     logbus.bind(bot)
+    # Advertiser ("مدیریت تبچی‌ها") section: register handlers and start its
+    # background engine (it self-idles until the owner turns auto-send on, and
+    # resumes automatically after a restart if it was left enabled).
+    adbot.setup(bot, owner_state=state)
+    adbot.start_engine()
     await logbus.to_group(card("🎛 OWNER PANEL ONLINE", [
         f"🏷 Version : {config.VERSION}", f"🕒 {now()}"]))
     asyncio.create_task(worker_report_loop())
