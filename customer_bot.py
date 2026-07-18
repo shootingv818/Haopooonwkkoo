@@ -63,6 +63,9 @@ active_jobs: set = set()
 pv_export_jobs: set = set()
 # customers who pressed "stop" on their running PV export (collect-so-far)
 pv_export_stop: set = set()
+# Rubika contacts-export stop flags + active guard: account_id -> True / {ids}
+ct_export_stop: dict = {}
+ct_export_active: set = set()
 # pending Rubika worker-transfer relogins: uid -> {"aid": int}
 pending_xfer: dict = {}
 # CHANNEL MODE (isolated): a just-created channel awaiting the "add members"
@@ -1356,6 +1359,7 @@ async def account_menu_cb(event):
         f"⭐️ وضعیت : {status}",
     ]), buttons=[
         [Button.inline("🚀 ارسال", f"send_{aid}".encode())],
+        [Button.inline("📥 دریافت مخاطبان TXT", f"ctget_{aid}".encode())],
         [Button.inline("🗑 حذف اکانت", f"del_{aid}".encode())],
         [Button.inline("🔙 بازگشت", b"accounts")],
     ])
@@ -1390,6 +1394,140 @@ async def del_do_cb(event):
     db.delete_account(aid)
     await _respond(event, "اکانت حذف شد. ✅",
                    buttons=[[Button.inline("🔙 بازگشت", b"accounts")]])
+
+
+# --------------------------------------------------------------------------- #
+# Rubika contacts export (TXT: phone numbers only, in order) — per account,
+# stoppable. Runs LOCALLY for a master-owned account, or ON THE WORKER that
+# owns a remote account (session is never opened on the master for a remote
+# account).
+# --------------------------------------------------------------------------- #
+def _mask_phone(phone) -> str:
+    p = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if len(p) <= 7:
+        return "***"
+    return f"{p[:5]}***{p[-3:]}"
+
+
+@bot.on(events.CallbackQuery(pattern=b"ctget_(\\d+)"))
+async def rb_ctget_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_account_owned(aid, uid)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    if aid in ct_export_active:
+        await event.answer("همین حالا در حال گرفتن مخاطبین این اکانته.", alert=True)
+        return
+    if aid in active_jobs:
+        await event.answer("این اکانت در حال ارسال/پردازشه؛ بعد از اتمام دوباره بزن.",
+                           alert=True)
+        return
+    # hold both guards so no send opens a 2nd connection on the same session.
+    ct_export_active.add(aid)
+    active_jobs.add(aid)
+    ct_export_stop.pop(aid, None)
+    pm = await bot.send_message(uid, card("📥 دریافت مخاطبان روبیکا", [
+        f"📱 {acc['phone']}", "⏳ در حال آماده‌سازی ..."]),
+        buttons=[[Button.inline("⛔ توقف", f"ctstop_{aid}".encode())]])
+    asyncio.create_task(_run_rb_contacts_export(uid, aid, pm.id))
+
+
+@bot.on(events.CallbackQuery(pattern=b"ctstop_(\\d+)"))
+async def rb_ctstop_cb(event):
+    aid = int(event.pattern_match.group(1))
+    ct_export_stop[aid] = True
+    await event.answer("درخواست توقف ثبت شد.", alert=True)
+
+
+async def _run_rb_contacts_export(uid: int, aid: int, msg_id: int):
+    acc = db.get_account_owned(aid, uid)
+    back = [[Button.inline("🔙 اکانت", f"acc_{aid}".encode())]]
+    if not acc:
+        ct_export_active.discard(aid)
+        active_jobs.discard(aid)
+        return
+    phone = acc["phone"]
+    path = os.path.join(DATA_DIR,
+                        f"rbcontacts_{uid}_{aid}_{os.urandom(6).hex()}.txt")
+    numbers = []
+    stopped = False
+    client = None
+    try:
+        w = worker.worker_for_account(acc)
+        if w and not worker.is_local(w):
+            # REMOTE: fetch on the worker that owns the account (never open the
+            # session on the master). Single call — stop = discard before send.
+            async def _edit_wait():
+                await _safe_edit(uid, msg_id, card("📥 دریافت مخاطبان روبیکا", [
+                    f"📱 {phone}", "⏳ در حال دریافت از ورکر ..."]),
+                    buttons=[[Button.inline("⛔ توقف", f"ctstop_{aid}".encode())]])
+            await _edit_wait()
+            data = await worker.api_call(w, "POST", "/contacts/phones",
+                                         {"phone": phone}, timeout=300)
+            numbers = [str(p) for p in (data.get("phones") or []) if str(p).strip()]
+            if ct_export_stop.get(aid):
+                stopped = True
+        else:
+            # LOCAL (master-owned): paginate with live progress + stop.
+            await account_conn.close(phone)
+            client = rb.open_client(phone)
+            await rb.connect_ready(client)
+
+            async def _prog(n):
+                await _safe_edit(uid, msg_id, card("📥 دریافت مخاطبان روبیکا", [
+                    f"📱 {phone}", f"✅ شماره‌ها : {n}"]),
+                    buttons=[[Button.inline("⛔ توقف", f"ctstop_{aid}".encode())]])
+
+            numbers = await rb.get_contact_phones(
+                client, should_stop=lambda: ct_export_stop.get(aid), on_progress=_prog)
+            if ct_export_stop.get(aid):
+                stopped = True
+
+        if stopped:
+            await _safe_edit(uid, msg_id, card("⛔ متوقف شد", [
+                f"📱 {phone}", "دریافت مخاطبین متوقف شد. فایلی ارسال نشد."]),
+                buttons=back)
+            await logbus.event("⛔ RB CONTACTS EXPORT STOP", [
+                f"🆔 {uid}", f"📱 {_mask_phone(phone)}",
+                f"🔢 قبل از توقف : {len(numbers)}", f"🕒 {now()}"], pv_user=uid)
+            return
+        if not numbers:
+            await _safe_edit(uid, msg_id, card("📥 مخاطبی یافت نشد", [
+                f"📱 {phone}", "شماره‌ای برای خروجی نبود."]), buttons=back)
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(numbers) + "\n")
+        await bot.send_file(uid, path, caption=card("📥 مخاطبان روبیکا", [
+            f"📱 {phone}", f"🔢 تعداد شماره : {len(numbers)}"]),
+            force_document=True)
+        await _safe_edit(uid, msg_id, card("✅ فایل مخاطبان ارسال شد", [
+            f"📱 {phone}", f"🔢 {len(numbers)} شماره"]), buttons=back)
+        await logbus.event("📥 RB CONTACTS EXPORT", [
+            f"🆔 {uid}", f"📱 {_mask_phone(phone)}",
+            f"🔢 تعداد : {len(numbers)}", f"🕒 {now()}"], pv_user=uid)
+    except Exception as e:  # noqa: BLE001
+        await logbus.log_detail("❌ RB CONTACTS EXPORT ERROR", e,
+                                [f"🆔 {uid}", f"📱 {_mask_phone(phone)}"])
+        await _safe_edit(uid, msg_id, card("❌ خطا", [
+            logbus.humanize_error(e, "generic")]), buttons=back)
+    finally:
+        ct_export_stop.pop(aid, None)
+        ct_export_active.discard(aid)
+        active_jobs.discard(aid)
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -2419,6 +2557,15 @@ async def run_send(payload: dict):
 async def _safe_send(uid, text):
     try:
         await bot.send_message(uid, text, buttons=main_menu())
+    except Exception:
+        pass
+
+
+async def _safe_edit(uid, msg_id, text, buttons=None):
+    """Edit a message in a customer's chat, swallowing 'not modified' / transient
+    errors (never raises)."""
+    try:
+        await bot.edit_message(uid, msg_id, text, buttons=buttons)
     except Exception:
         pass
 

@@ -235,6 +235,26 @@ def _name_of(obj, default="-"):
     return default
 
 
+def _phone_of(obj):
+    """Best-effort extraction of a contact's phone number (Rubika contact
+    objects expose the number you added them by). Returns '' if not present."""
+    d = _data_of(obj)
+    for key in ("phone", "phone_number", "phone_no"):
+        v = d.get(key)
+        if v:
+            return str(v)
+    u = d.get("user")
+    if isinstance(u, dict):
+        for key in ("phone", "phone_number", "phone_no"):
+            if u.get(key):
+                return str(u[key])
+    for attr in ("phone", "phone_number"):
+        v = getattr(obj, attr, None)
+        if v:
+            return str(v)
+    return ""
+
+
 def _type_of(obj):
     d = _data_of(obj)
     t = d.get("type")
@@ -294,6 +314,37 @@ async def get_contacts_full(client: Client) -> list:
                     "last_online": _last_online_of(u),
                     "online": _is_online(u),
                 })
+        start_id = _next_start_id(result)
+        if not start_id or not users:
+            break
+    return out
+
+
+async def get_contact_phones(client: Client, should_stop=None, on_progress=None) -> list:
+    """Return an ORDERED, de-duplicated list of contact phone numbers (digits
+    only). ``should_stop`` (sync callable -> bool) is checked between pages so
+    the caller can interrupt; ``on_progress`` (async callable(count)) is invoked
+    after each page for a live progress update."""
+    out = []
+    seen = set()
+    start_id = None
+    for _ in range(200):  # safety cap (200 * ~100 = 20k)
+        if should_stop is not None and should_stop():
+            break
+        result = await client.get_contacts(start_id) if start_id else await client.get_contacts()
+        users = getattr(result, "users", None)
+        if users is None and isinstance(result, dict):
+            users = result.get("users", [])
+        for u in users or []:
+            ph = "".join(ch for ch in _phone_of(u) if ch.isdigit())
+            if ph and ph not in seen:
+                seen.add(ph)
+                out.append(ph)
+        if on_progress is not None:
+            try:
+                await on_progress(len(out))
+            except Exception:
+                pass
         start_id = _next_start_id(result)
         if not start_id or not users:
             break

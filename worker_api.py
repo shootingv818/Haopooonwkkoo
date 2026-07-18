@@ -638,6 +638,22 @@ def _build_app():
         dead = await account_conn.verify_session_dead(body.phone)
         return {"ok": True, "dead": bool(dead)}
 
+    # ----- contacts export (phone numbers only) -----
+    @app.post("/contacts/phones")
+    async def contacts_phones(body: PhoneIn, authorization: str = Header(None)):
+        _auth(authorization)
+        await account_conn.close(body.phone)   # ensure single connection
+        client = rb.open_client(body.phone)
+        try:
+            await rb.connect_ready(client)
+            phones = await rb.get_contact_phones(client)
+            return {"ok": True, "phones": phones, "count": len(phones)}
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
     @app.post("/group/leave")
     async def group_leave(body: GroupLeaveIn, authorization: str = Header(None)):
         _auth(authorization)
