@@ -3324,6 +3324,8 @@ async def amain():
     await bot.start(bot_token=config.CUSTOMER_BOT_TOKEN)
     logbus.bind(bot)
     tg_panel.setup(bot, state)   # register the decoupled Telegram section
+    import telegram_multi_send as _tg_multi
+    asyncio.create_task(_tg_multi.restore_pending())  # resume interrupted multi-sends
     group_panel.setup(bot, run_send=run_send, active_jobs=active_jobs,
                       stop_flags=stop_flags, pending_send=pending_send,
                       customer_active_account=customer_active_account,

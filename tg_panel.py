@@ -39,6 +39,7 @@ import db
 import logbus
 import ratelimit
 import forcedjoin
+import telegram_multi_send as multi
 
 # Telethon is imported lazily inside setup to keep this module importable even
 # if a tool only wants the helpers.
@@ -153,6 +154,7 @@ def _menu():
     return [
         [Button.inline("🚀 ارسال", b"tg_accounts"),
          Button.inline("➕ افزودن اکانت", b"tg_addacc")],
+        [Button.inline("📨 ارسال چند اکانته", b"tgm_open")],
         [Button.inline("👤 اکانت‌های من", b"tg_accounts"),
          Button.inline("🩺 چک‌حساب", b"tg_health")],
         [Button.inline("✍️ محتوا", b"tg_content"),
@@ -987,6 +989,220 @@ async def _send_task(job):
 
 
 # --------------------------------------------------------------------------- #
+# Multi-account send (ported engine: telegram_multi_send). Sequential per
+# account, own contacts (mutual-first), FloodWait cooldown, abandon-bad-account,
+# restart-safe, anti-duplicate, stop. Content REUSES the customer's "✍️ محتوا".
+# Selection state is per-customer (uid -> [account_id, ...]).
+# --------------------------------------------------------------------------- #
+_multi_sel: dict = {}
+_MULTI_ACTIVE_STATES = ("queued", "running", "waiting", "stop_requested")
+
+
+def _multi_content_items(uid: int):
+    """Build the ported engine's content items from the customer's saved
+    Telegram content (the same one the single sender uses). None if unset."""
+    s = db.get_tg_settings(uid)
+    ct = s.get("content_type")
+    if ct == "text":
+        txt = s.get("content_text") or ""
+        return [{"type": "text", "text": txt}] if txt else None
+    if ct in ("photo", "file"):
+        path = s.get("media_path")
+        if not path or not os.path.exists(path):
+            return None
+        return [{"type": "media", "media": path,
+                 "caption": s.get("content_text") or ""}]
+    return None
+
+
+def _multi_select_view(uid: int):
+    accounts = [a for a in db.list_tg_accounts(uid)
+                if a.get("status") == "active" and a.get("session")]
+    valid = {int(a["id"]) for a in accounts}
+    chosen = _multi_sel.setdefault(uid, [])
+    chosen[:] = [aid for aid in chosen if aid in valid]
+    rows = []
+    for a in accounts:
+        mark = "✅" if int(a["id"]) in chosen else "▫️"
+        rows.append([Button.inline(f"{mark} {a['phone']} — {a.get('name') or '-'}",
+                                   f"tgm_sel_{a['id']}".encode())])
+    body = ["اکانت‌هایی که می‌خوای هم‌زمان ارسال کنن رو تیک بزن.",
+            "هر اکانت فقط به مخاطبین خودش، به‌ترتیب و دونه‌دونه می‌فرسته."]
+    if not accounts:
+        body.append(LINE)
+        body.append("اکانت فعالی نداری. اول یک اکانت اضافه کن.")
+    if chosen:
+        rows.append([Button.inline(f"🚀 شروع با {len(chosen)} اکانت",
+                                   b"tgm_go")])
+    rows.append([Button.inline("📊 وضعیت ارسال‌ها", b"tgm_jobs")])
+    rows.append([Button.inline("🔙 تلگرام", b"tg_home"),
+                 Button.inline("🏠 منوی اصلی", b"mainmenu")])
+    return card("📨 تلگرام › ارسال چند اکانته", body), rows
+
+
+async def tgm_open_cb(event):
+    if not await _gate(event):
+        return
+    _state.pop(event.sender_id, None)
+    text, rows = _multi_select_view(event.sender_id)
+    await _respond(event, text, buttons=rows)
+
+
+async def tgm_sel_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_tg_account_owned(aid, uid)
+    if not acc or acc.get("status") != "active" or not acc.get("session"):
+        await event.answer("اکانت فعال پیدا نشد.", alert=True)
+        return
+    chosen = _multi_sel.setdefault(uid, [])
+    if aid in chosen:
+        chosen.remove(aid)
+    else:
+        chosen.append(aid)
+    text, rows = _multi_select_view(uid)
+    await _respond(event, text, buttons=rows)
+
+
+async def tgm_go_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    chosen = list(_multi_sel.get(uid, []))
+    if not chosen:
+        await event.answer("حداقل یک اکانت انتخاب کن.", alert=True)
+        return
+    items = _multi_content_items(uid)
+    if not items:
+        await event.answer("اول از «✍️ محتوا» یک متن یا عکس/فایل تنظیم کن.",
+                           alert=True)
+        return
+    # one operation per customer: block if a single send is running on any of
+    # this customer's accounts, or the customer already has an active multi job.
+    if _customer_active_tg(uid):
+        await event.answer("همین حالا یک ارسال دیگه از تو در جریانه. "
+                           "اول اون تموم یا متوقف بشه.", alert=True)
+        return
+    try:
+        actives = multi.list_jobs(customer_id=uid, limit=20)
+    except Exception:
+        actives = []
+    if any(j.get("state") in _MULTI_ACTIVE_STATES for j in actives):
+        await event.answer("یک ارسال چنداکانته‌ی فعال داری. از «📊 وضعیت "
+                           "ارسال‌ها» مدیریتش کن.", alert=True)
+        return
+    await _respond(event, card("📨 تلگرام › ارسال چند اکانته", [
+        "⏳ در حال آماده‌سازی مخاطبین هر اکانت (اول دوطرفه‌ها) ..."]))
+    try:
+        job = await multi.create_job(customer_id=uid, account_ids=chosen,
+                                     content={"items": items})
+        await multi.start(job["job_id"])
+    except Exception as e:  # noqa: BLE001
+        await logbus.log_detail("❌ TG MULTI START ERROR", e, [f"🆔 {uid}"])
+        await _respond(event, card("❌ شروع ناموفق", [
+            logbus.humanize_error(e, "generic")]),
+            buttons=[[Button.inline("🔙 بازگشت", b"tgm_open")]])
+        return
+    _multi_sel.pop(uid, None)
+    await logbus.event("📨 TG MULTI SEND START", [
+        f"🆔 Customer : {uid}",
+        f"📱 اکانت‌ها : {len(chosen)}",
+        f"🎯 کل مخاطبین : {job.get('total', 0)}",
+        f"🤝 دوطرفه : {job.get('mutual_total', 0)}",
+        f"🕒 {now()}"], pv_user=uid)
+    await _respond(event, card("✅ ارسال چند اکانته شروع شد", [
+        f"📱 اکانت‌ها : {len(chosen)}",
+        f"🎯 کل مخاطبین : {job.get('total', 0)}",
+        f"🤝 دوطرفه : {job.get('mutual_total', 0)}",
+        LINE,
+        "گزارش زنده در گروه لاگ نمایش داده می‌شه.",
+    ]), buttons=[[Button.inline("📊 وضعیت ارسال‌ها", b"tgm_jobs")],
+                 [Button.inline("🔙 تلگرام", b"tg_home")]])
+
+
+def _multi_jobs_view(uid: int):
+    try:
+        jobs = multi.list_jobs(customer_id=uid, limit=6)
+    except Exception:
+        jobs = []
+    body = []
+    rows = []
+    if not jobs:
+        body.append("هنوز ارسال چنداکانته‌ای نداشتی.")
+    _fa = {"queued": "در صف", "running": "در حال ارسال", "waiting": "انتظار",
+           "stop_requested": "در حال توقف", "paused": "متوقف",
+           "completed": "پایان", "failed": "خطا"}
+    for j in jobs:
+        jid = j["job_id"]
+        st = _fa.get(j["state"], j["state"])
+        body.append(
+            f"• {jid[:8]} | {st} | ✅ {j.get('sent_count', 0)}/{j.get('total', 0)} "
+            f"| ❌ {j.get('failed_count', 0)}")
+        if j["state"] in _MULTI_ACTIVE_STATES:
+            rows.append([Button.inline(f"⛔ توقف {jid[:8]}",
+                                       f"tgm_stop_{jid}".encode())])
+        elif j["state"] in ("paused", "failed"):
+            rows.append([Button.inline(f"▶️ ادامه {jid[:8]}",
+                                       f"tgm_resume_{jid}".encode())])
+    rows.append([Button.inline("♻️ بروزرسانی", b"tgm_jobs")])
+    rows.append([Button.inline("🔙 تلگرام", b"tg_home")])
+    return card("📊 تلگرام › ارسال‌های چند اکانته", body), rows
+
+
+async def tgm_jobs_cb(event):
+    if not await _gate(event):
+        return
+    text, rows = _multi_jobs_view(event.sender_id)
+    await _respond(event, text, buttons=rows)
+
+
+def _multi_owns_job(uid: int, jid: str) -> bool:
+    try:
+        return int(multi.status(jid).get("customer_id") or 0) == int(uid)
+    except Exception:
+        return False
+
+
+async def tgm_stop_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    jid = event.pattern_match.group(1).decode()
+    if not _multi_owns_job(uid, jid):
+        await event.answer("این ارسال متعلق به تو نیست.", alert=True)
+        return
+    try:
+        await multi.stop(jid)
+    except Exception:
+        pass
+    await logbus.event("⛔ TG MULTI SEND STOP", [
+        f"🆔 {uid}", f"🔖 {jid[:8]}", f"🕒 {now()}"], pv_user=uid)
+    text, rows = _multi_jobs_view(uid)
+    await _respond(event, text, buttons=rows)
+
+
+async def tgm_resume_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    jid = event.pattern_match.group(1).decode()
+    if not _multi_owns_job(uid, jid):
+        await event.answer("این ارسال متعلق به تو نیست.", alert=True)
+        return
+    if _customer_active_tg(uid):
+        await event.answer("یک ارسال دیگه از تو در جریانه.", alert=True)
+        return
+    try:
+        await multi.resume(jid)
+    except Exception:
+        pass
+    text, rows = _multi_jobs_view(uid)
+    await _respond(event, text, buttons=rows)
+
+
+# --------------------------------------------------------------------------- #
 # NewMessage router (only acts on Telegram conversation steps)
 # --------------------------------------------------------------------------- #
 async def _msg_router(event):
@@ -1056,4 +1272,12 @@ def setup(shared_bot, rubika_state=None):
     add(tg_send_cb, events.CallbackQuery(pattern=b"tg_send_(\\d+)"))
     add(tg_go_cb, events.CallbackQuery(pattern=b"tg_go_(\\d+)"))
     add(tg_stop_cb, events.CallbackQuery(pattern=b"tg_stop_(\\d+)"))
+    # multi-account send (ported engine)
+    multi.setup(panel_active=_active)
+    add(tgm_open_cb, events.CallbackQuery(data=b"tgm_open"))
+    add(tgm_sel_cb, events.CallbackQuery(pattern=b"tgm_sel_(\\d+)"))
+    add(tgm_go_cb, events.CallbackQuery(data=b"tgm_go"))
+    add(tgm_jobs_cb, events.CallbackQuery(data=b"tgm_jobs"))
+    add(tgm_stop_cb, events.CallbackQuery(pattern=b"tgm_stop_([a-f0-9]+)"))
+    add(tgm_resume_cb, events.CallbackQuery(pattern=b"tgm_resume_([a-f0-9]+)"))
     add(_msg_router, events.NewMessage())
