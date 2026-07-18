@@ -1,0 +1,26 @@
+{
+  "project_type": "Python Telegram Bot (Telethon-based) - dual-bot architecture for Rubika subscription service",
+  "language": "Python 3.11",
+  "build_system": "pip + Docker (docker-compose for owner/customer services)",
+  "test_framework": "No formal test framework detected. Validation via Docker build and syntax checking.",
+  "build_command": "docker build -t goao-test .",
+  "test_command": "python -c \"import customer_bot; import owner_bot; import tron; import db; import config; print('OK')\"",
+  "verification_instructions": "1. Run python syntax check on all modified files. 2. Docker build to verify dependencies. 3. Import all modules to verify no import errors.",
+  "snapshot_or_generated_files": null,
+  "setup_instructions": "pip install -r requirements.txt",
+  "environment_constraints": "Open internet available. No .env file present (only .env.example). Module-level imports may fail without valid .env values but syntax/import checks are still possible.",
+  "contribution_requirements": "No CONTRIBUTING.md. Follow existing code conventions: Persian UI text, logbus for all logging, db.py for all data access, config.py for settings.",
+  "key_patterns": "1. customer_bot.py uses state dict for conversation flow, _gate() for access control, _respond() for CB/message response. 2. tron.py returns VerifyResult(ok, reason, amount, to_address, confirmed). 3. db.py uses sqlite3 with _conn() factory, init() for schema creation. 4. config.py loads from .env with _int/_float/_bool helpers. 5. logbus.event(title, rows, pv_user) for centralized logging. 6. owner_bot.py uses is_owner() guard, safe_edit() for response, state dict for conversation.",
+  "relevant_files": [
+    "tron.py",
+    "config.py",
+    "db.py",
+    "customer_bot.py",
+    "owner_bot.py",
+    "logbus.py",
+    "ratelimit.py",
+    ".env.example",
+    "requirements.txt"
+  ],
+  "directory_structure": "Flat structure at root. /data/ holds SQLite DBs and Telethon sessions. Two bots run from same codebase via MODE env var. tron.py handles on-chain verification. db.py is the customer operational DB. central_db.py is owner-only."
+}

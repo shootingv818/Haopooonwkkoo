@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Secrets & runtime data (NEVER commit these)
+.env
+data/
+*.session
+*.session-journal
+maintenance.flag

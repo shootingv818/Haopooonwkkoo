@@ -1,0 +1,34 @@
+{
+  "id": "FEAT-003",
+  "type": "feat",
+  "description": "Upgrade owner_bot.py with plan price management, transaction list, TRX price settings (override + tolerance), broadcast to ALL starters, and enhanced financial dashboard",
+  "status": "completed",
+  "steps": [
+    "Add a new 'settings' section to the owner main_menu: Add '💲 تنظیمات قیمت' button. Rearrange main_menu to include it alongside existing buttons.",
+    "Implement price management handler (price_settings_cb): Show current plan prices (from config.PLANS which reads from .env). Allow the owner to change prices at runtime. Store overrides in a new table in db.py: 'plan_overrides' (plan_key TEXT PRIMARY KEY, price REAL). Add db functions: get_plan_price(key) -> float (checks override first, falls back to config), set_plan_price(key, price). The customer_bot reads plan price via db.get_plan_price() so changes take effect without restart.",
+    "Implement TRX price settings handler (trx_settings_cb): Show current TRX price (from cache/CoinGecko), current override value, current tolerance %. Allow owner to set manual TRX price override (stored in DB, runtime-changeable: add 'settings' table in db.py with key-value pairs). Allow owner to change tolerance %. Add db functions: get_setting(key, default), set_setting(key, value). tron.py reads TRX_PRICE_OVERRIDE and PAYMENT_TOLERANCE_PERCENT from db.get_setting() first, falling back to config values.",
+    "Implement transaction list handler (transactions_cb): Show last 20 payments from db.list_payments() with status, plan, amount (TRX), customer ID, date. Paginate with 'next' button if needed.",
+    "Update broadcast handler (do_broadcast): Currently sends to db.list_customers() which is all who have a row (i.e., all who have /start-ed the bot). This already covers 'broadcast to everyone who started the bot'. Verify this is correct. Add a count preview before sending ('X نفر دریافت می‌کنند. ادامه؟').",
+    "Enhance the dashboard (dash_cb): Add financial stats -- today's revenue (TRX), this week's revenue, this month's revenue using db.today_revenue_trx(), db.week_revenue_trx(), db.month_revenue_trx(). Show total revenue in TRX instead of USDT. Show current TRX price.",
+    "Add conversation states and text_router handling for: price change input, TRX override input, tolerance input. Follow the existing pattern (state dict with step key).",
+    "Add appropriate logbus.event() calls for all owner admin actions (price change, TRX override, tolerance change)."
+  ],
+  "acceptance_criteria": [
+    "Owner can change plan prices from the panel without restart",
+    "Owner can set/clear TRX price override from the panel",
+    "Owner can change payment tolerance % from the panel",
+    "Transaction list shows recent payments with relevant details",
+    "Broadcast sends to ALL customers who started the bot",
+    "Dashboard shows today/week/month revenue in TRX",
+    "All admin actions logged to logbus",
+    "db.py has plan_overrides table and settings table with appropriate helpers",
+    "python -m py_compile owner_bot.py passes"
+  ],
+  "verification": [
+    "python -m py_compile owner_bot.py && echo 'owner_bot.py OK'",
+    "python -m py_compile db.py && echo 'db.py OK'",
+    "python -c \"import owner_bot; print('import OK')\""
+  ],
+  "blocked_reason": null,
+  "findings": "All acceptance criteria met. 1) Owner can change plan prices via prices menu + await_price_input state. 2) Owner can set/clear TRX price override via trx_settings + await_trx_override. 3) Owner can change tolerance via set_tolerance + await_tolerance. 4) Transaction list shows last 20 payments with pagination. 5) Broadcast now shows count preview before sending (await_broadcast_confirm state). 6) Dashboard shows today/week/month TRX revenue + live TRX price. 7) All admin actions logged via logbus.to_group and central_db.audit. 8) db.py already had plan_overrides and settings tables from FEAT-001. 9) python -m py_compile owner_bot.py passes. 10) USDT references in _profile_text and dashboard replaced with TRX. 11) import tron added to owner_bot.py."
+}
