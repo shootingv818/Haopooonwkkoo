@@ -48,6 +48,7 @@ bot = TelegramClient(os.path.join(DATA_DIR, "customer_bot"),
                      config.API_ID, config.API_HASH)
 
 LINE = logbus.LINE
+DASH = "-" * 31          # dash separator used by the English root/start panel
 
 # per-user conversation state
 state: dict = {}
@@ -206,28 +207,41 @@ def _sub_line(uid: int) -> str:
 
 
 def _account_stats_line(uid: int) -> str:
-    """Short per-customer account + send-count summary shown at the top of the
-    root panel (Rubika and Telegram, this customer only)."""
+    """Per-customer account + send-count dashboard shown at the top of the root
+    panel (Rubika + Telegram, this customer only). English. ``healthy`` counts
+    accounts whose session is still marked ``active`` (not dead/revoked)."""
     try:
+        rb = db.list_accounts(uid)
+        tg = db.list_tg_accounts(uid)
         cust = db.get_customer(uid) or {}
-        rb_acc = db.count_customer_accounts(uid)
+        rb_acc = len(rb)
+        rb_ok = sum(1 for a in rb if (a.get("status") or "active") == "active")
         rb_send = int(cust.get("total_sends") or 0)
-        tg_acc = db.count_customer_tg_accounts(uid)
+        tg_acc = len(tg)
+        tg_ok = sum(1 for a in tg if (a.get("status") or "active") == "active")
         tg_send = int((db.get_tg_settings(uid) or {}).get("total_sends") or 0)
     except Exception:
         return ""
-    return (f"🟣 روبیکا: {rb_acc} اکانت | 🚀 {rb_send}\n"
-            f"✈️ تلگرام: {tg_acc} اکانت | 🚀 {tg_send}")
+    total_send = rb_send + tg_send
+    return (
+        f"🟣 Rubika\n"
+        f"   👤 Accounts: {rb_acc}  ({rb_ok} healthy)\n"
+        f"   → Total Sent: {rb_send:,}\n\n"
+        f"✈️ Telegram\n"
+        f"   👤 Accounts: {tg_acc}  ({tg_ok} healthy)\n"
+        f"   → Total Sent: {tg_send:,}\n"
+        f"{DASH}\n"
+        f"▪ Total Sent: {total_send:,}"
+    )
 
 
 def _root_text(uid: int) -> str:
-    """Root panel text: access line + this customer's account/send stats."""
-    header = _sub_line(uid)
+    """Root panel text (English): title + this customer's account/send stats."""
     stats = _account_stats_line(uid)
-    body = f"🤖 پنل ربات\n{LINE}\n{header}"
+    body = f"🤖 Bot Panel\n{DASH}"
     if stats:
         body += f"\n{stats}"
-    body += "\n\nکدوم بخش؟ 📨 تلگرام یا 🟣 روبیکا:"
+    body += "\n\nRubika , Telegram\nWhich section do you want to open?"
     return body
 
 
@@ -770,12 +784,6 @@ async def help_cb(event):
         return
     text = (
         "📖 راهنمای ربات\n" + LINE + "\n"
-        "🛒 خرید اشتراک / تمدید: یکی از پلن‌ها رو می‌زنی، مبلغ به TRX نشون داده "
-        "می‌شه. خرید وقتی اشتراک فعال داری = تمدید (روزها روی هم جمع می‌شن).\n\n"
-        "💰 موجودی: کیف پول داخلی توئه. هر مقدار TRX شارژ کنی اینجا جمع می‌شه و "
-        "موقع خرید پلن از همین کم می‌شه.\n\n"
-        "💳 شارژ حساب: مبلغ دلخواه TRX به آدرس ولت می‌فرستی، بعد هشِ تراکنش "
-        "(یا لینک tronscan) رو می‌دی تا به موجودیت اضافه شه.\n\n"
         "➕ افزودن اکانت: اکانت روبیکات رو با شماره + کد (و رمز دومرحله‌ای اگه "
         "داشت) وصل می‌کنی.\n\n"
         "👤 اکانت‌های من: لیست اکانت‌های وصل‌شده + حذف.\n\n"
@@ -787,7 +795,7 @@ async def help_cb(event):
         "⚙️ سرعت ارسال: فاصله‌ی زمانی بین هر ارسال (هرچی بیشتر، امن‌تر).\n\n"
         "🖼 ایمپورت عکس پیوی (PDF): عکس‌های پیویِ یه اکانت رو جمع و به PDF تبدیل "
         "می‌کنه.\n\n"
-        "📊 آمار من: کل ارسال‌ها، موجودی، و وضعیت اشتراکت.\n\n"
+        "📊 آمار من: کل ارسال‌ها و وضعیت اکانت‌هات.\n\n"
         "📌 مارکر: مهم‌ترین بخش — دکمه‌ی پایین رو بزن.\n" + LINE + "\n"
         "🔒 امنیت: همه‌چیز برای هر کاربر کاملاً جداست؛ هیچکس اکانت‌ها یا "
         "اطلاعات تو رو نمی‌بینه."
