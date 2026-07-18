@@ -159,7 +159,8 @@ def _menu():
          Button.inline("🩺 چک‌حساب", b"tg_health")],
         [Button.inline("✍️ محتوا", b"tg_content"),
          Button.inline("⚙️ سرعت/تاخیر", b"tg_speed")],
-        [Button.inline("🎯 مقصد ارسال", b"tg_target")],
+        [Button.inline("🎯 مقصد ارسال", b"tg_target"),
+         Button.inline("🧹 پاک‌سازی بعد از ارسال", b"tg_delset")],
         [Button.inline("📊 آمار من", b"tg_stats"),
          Button.inline("📖 راهنما", b"tg_help")],
         [Button.inline("🏠 منوی اصلی", b"mainmenu")],
@@ -662,6 +663,41 @@ async def tg_tgt_cb(event):
 
 
 # --------------------------------------------------------------------------- #
+# One-sided delete-after-send toggle (delete only on the sender's side).
+# --------------------------------------------------------------------------- #
+async def tg_delset_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    on = db.get_tg_delete_after(uid)
+    rows = [
+        [Button.inline(("✅ " if not on else "") + "خاموش", b"tg_delset_off")],
+        [Button.inline(("✅ " if on else "") + "حذف فقط برای من", b"tg_delset_on")],
+        [Button.inline("🔙 تلگرام", b"tg_home")],
+    ]
+    await _respond(event, card("🧹 تلگرام › پاک‌سازی بعد از ارسال", [
+        f"وضعیت فعلی : {'حذف فقط برای من ✅' if on else 'خاموش'}",
+        LINE,
+        "وقتی روشن باشه، بعد از هر ارسالِ موفق به یک مخاطب، همون پیام فقط از",
+        "چتِ اکانتِ خودت پاک می‌شه — برای گیرنده باقی می‌مونه (حذف یک‌طرفه).",
+        "فقط روی چت‌های خصوصیه؛ گروه/کانال دست‌نخورده می‌مونه.",
+        "روی ارسال تکی و چنداکانته، هر دو، اعمال می‌شه.",
+    ]), buttons=rows)
+
+
+async def tg_delset_set_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    on = event.data.decode().endswith("_on")
+    db.set_tg_delete_after(uid, on)
+    await logbus.event("🧹 TG DELETE-AFTER", [
+        f"🆔 {uid}", f"وضعیت : {'حذف فقط برای من' if on else 'خاموش'}",
+        f"🕒 {now()}"], pv_user=uid)
+    await tg_delset_cb(event)
+
+
+# --------------------------------------------------------------------------- #
 # My stats
 # --------------------------------------------------------------------------- #
 async def tg_stats_cb(event):
@@ -817,12 +853,25 @@ async def _prepare_media(client, s):
 
 
 async def _send_one(client, peer, s, prepared_media):
+    """Send the configured content to one peer and RETURN the sent Message
+    (needed for the one-sided delete-after feature)."""
     ct = s.get("content_type")
     caption = s.get("content_text") or ""
     if ct == "text":
-        await client.send_message(peer, s.get("content_text") or "")
-    else:
-        await client.send_file(peer, prepared_media, caption=caption)
+        return await client.send_message(peer, s.get("content_text") or "")
+    return await client.send_file(peer, prepared_media, caption=caption)
+
+
+async def _delete_own_after(client, peer, sent):
+    """One-sided delete: remove the just-sent message ONLY from the sender
+    account's side (revoke=False). Applied to PRIVATE chats only — group/channel
+    messages are never touched (deleting there would remove it for everyone)."""
+    try:
+        if sent is None or not getattr(sent, "is_private", False):
+            return
+        await client.delete_messages(peer, [sent.id], revoke=False)
+    except Exception:
+        pass
 
 
 async def _do_send(job):
@@ -837,6 +886,7 @@ async def _do_send(job):
         await _safe_edit(uid, msg_id, "⚠️ محتوایی تنظیم نشده.")
         return
     delay = config.clamp_tg_delay(s.get("send_delay"))
+    del_after = bool(s.get("delete_after"))
     client = TelegramClient(StringSession(acc.get("session") or ""),
                             config.API_ID, config.API_HASH)
     ok = fail = total = 0
@@ -885,10 +935,12 @@ async def _do_send(job):
                 stopped = True
                 break
             try:
-                await asyncio.wait_for(_send_one(client, peer, s, prepared),
-                                       timeout=config.TG_SEND_TIMEOUT)
+                sent = await asyncio.wait_for(_send_one(client, peer, s, prepared),
+                                              timeout=config.TG_SEND_TIMEOUT)
                 ok += 1
                 consec_fail = 0
+                if del_after:
+                    await _delete_own_after(client, peer, sent)
             except FloodWaitError as fw:
                 wait_s = int(getattr(fw, "seconds", 5))
                 # too long -> don't freeze silently; stop and tell the customer
@@ -911,10 +963,12 @@ async def _do_send(job):
                     break
                 # one retry of the SAME peer after the wait
                 try:
-                    await asyncio.wait_for(_send_one(client, peer, s, prepared),
-                                           timeout=config.TG_SEND_TIMEOUT)
+                    sent = await asyncio.wait_for(_send_one(client, peer, s, prepared),
+                                                  timeout=config.TG_SEND_TIMEOUT)
                     ok += 1
                     consec_fail = 0
+                    if del_after:
+                        await _delete_own_after(client, peer, sent)
                 except Exception:  # noqa: BLE001
                     fail += 1
                     consec_fail += 1
@@ -1267,6 +1321,8 @@ def setup(shared_bot, rubika_state=None):
     add(tg_spd_cb, events.CallbackQuery(pattern=b"tg_spd_([0-9.]+)"))
     add(tg_target_cb, events.CallbackQuery(data=b"tg_target"))
     add(tg_tgt_cb, events.CallbackQuery(pattern=b"tg_tgt_(both|contacts|groups)"))
+    add(tg_delset_cb, events.CallbackQuery(data=b"tg_delset"))
+    add(tg_delset_set_cb, events.CallbackQuery(pattern=b"tg_delset_(on|off)"))
     add(tg_stats_cb, events.CallbackQuery(data=b"tg_stats"))
     add(tg_help_cb, events.CallbackQuery(data=b"tg_help"))
     add(tg_send_cb, events.CallbackQuery(pattern=b"tg_send_(\\d+)"))

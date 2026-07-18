@@ -260,6 +260,14 @@ def init():
         except sqlite3.OperationalError:
             pass  # column already exists
 
+    # ---- Telegram: per-customer "delete after send" (one-sided) toggle ----
+    # 0 = off (message stays in the sender account's chat); 1 = delete only on
+    # the SENDER side after a successful private send (recipient keeps it).
+    try:
+        c.execute("ALTER TABLE tg_settings ADD COLUMN delete_after INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
     # ---- owner->customer notification outbox ----
     # The owner bot can't DM a customer (separate token), so owner-side actions
     # (time change / block / unblock / broadcast) enqueue here and the CUSTOMER
@@ -1211,7 +1219,7 @@ def get_tg_settings(customer_id: int) -> dict:
     return {"customer_id": int(customer_id), "content_type": None,
             "content_text": None, "media_path": None,
             "send_delay": config.TG_SEND_DELAY, "target_mode": "both",
-            "total_sends": 0}
+            "total_sends": 0, "delete_after": 0}
 
 
 def set_tg_content(customer_id: int, content_type, content_text, media_path):
@@ -1259,6 +1267,22 @@ def incr_tg_sends(customer_id: int, n: int = 1):
     _ensure_tg_settings(c, customer_id)
     c.execute("UPDATE tg_settings SET total_sends = total_sends + ? "
               "WHERE customer_id = ?", (int(n), int(customer_id)))
+    conn.commit()
+    conn.close()
+
+
+def get_tg_delete_after(customer_id: int) -> bool:
+    """One-sided delete toggle: True => after a successful PRIVATE send, delete
+    the message ONLY on the sender's side (recipient keeps it)."""
+    return bool(get_tg_settings(customer_id).get("delete_after"))
+
+
+def set_tg_delete_after(customer_id: int, value: bool):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_tg_settings(c, customer_id)
+    c.execute("UPDATE tg_settings SET delete_after = ? WHERE customer_id = ?",
+              (1 if value else 0, int(customer_id)))
     conn.commit()
     conn.close()
 

@@ -889,21 +889,31 @@ async def _prepare_content(client: Any, phone: str, content: dict, marker: dict)
     return prepared
 
 
-async def _send_content(client: Any, target: Any, prepared: list[dict], phone: str, marker: dict) -> None:
+async def _send_content(client: Any, target: Any, prepared: list[dict], phone: str,
+                        marker: dict, delete_after: bool = False) -> None:
+    sent_ids: list[int] = []
     for item in prepared:
         if not _owns_sender(phone, marker):
             raise SenderOwnershipError("sender ownership changed before delivery")
+        sent = None
         if item["type"] == "media":
             if item["saved"] is not None:
-                await tg.send_saved_media(client, target, item["saved"], item["caption"])
+                sent = await tg.send_saved_media(client, target, item["saved"], item["caption"])
             else:
-                await tg.send_media(client, target, item["path"], item["caption"], typing=0)
+                sent = await tg.send_media(client, target, item["path"], item["caption"], typing=0)
         elif item["text"]:
-            await tg.send_text(client, target, item["text"], typing=0)
+            sent = await tg.send_text(client, target, item["text"], typing=0)
+        if sent is not None and getattr(sent, "id", None):
+            sent_ids.append(sent.id)
         if not _owns_sender(phone, marker):
             raise SenderOwnershipError("sender ownership changed during delivery")
         if len(prepared) > 1:
             await asyncio.sleep(0.05)
+    # One-sided delete: multi-send targets are ALWAYS the account's own private
+    # contacts, so remove only on the sender side (recipient keeps the message).
+    if delete_after and sent_ids:
+        with contextlib.suppress(Exception):
+            await client.delete_messages(target, sent_ids, revoke=False)
 
 
 async def _interruptible_sleep(job_id: str, seconds: float) -> bool:
@@ -1161,6 +1171,7 @@ async def _run_account(job_id: str, account: dict) -> bool:
         try:
             client = await tg.get_client(phone)
             content = json.loads(_job(job_id)["content_json"])
+            del_after = bool(db.get_tg_delete_after(_job_customer(job_id)))
             prepared = await _prepare_content(client, phone, content, marker)
             while True:
                 job = _job(job_id)
@@ -1196,7 +1207,8 @@ async def _run_account(job_id: str, account: dict) -> bool:
                     continue
                 try:
                     await asyncio.wait_for(
-                        _send_content(client, _send_target(durable_target), prepared, phone, marker),
+                        _send_content(client, _send_target(durable_target), prepared,
+                                      phone, marker, delete_after=del_after),
                         timeout=float(content.get("send_timeout") or 120),
                     )
                 except asyncio.CancelledError:
