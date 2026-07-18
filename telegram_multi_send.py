@@ -395,20 +395,21 @@ def _reserve_sender(phone: str, marker: dict) -> bool:
 
 
 async def _release_and_drop_sender(phone: str, marker: dict) -> bool:
-    """Drop our warm client while the busy marker still blocks new senders."""
+    """Drop our warm client and free the busy guards. The guard-release is done
+    in a finally so the account is freed even if this coroutine is CANCELLED
+    mid-disconnect (e.g. when a stop forcibly cancels the running task)."""
     if _REG.get(phone) is not marker:
         return False
-    # drop_client pops the warm client synchronously before its first disconnect
-    # await, so keeping the marker until this returns prevents a fresh ordinary
-    # sender from claiming the account in that handoff window.
-    await tg.drop_client(phone)
-    if _REG.get(phone) is marker:
-        _REG.pop(phone, None)
-    if _panel_active is not None:
-        try:
-            _panel_active.discard(int(phone))
-        except (TypeError, ValueError):
-            pass
+    try:
+        await tg.drop_client(phone)
+    finally:
+        if _REG.get(phone) is marker:
+            _REG.pop(phone, None)
+        if _panel_active is not None:
+            try:
+                _panel_active.discard(int(phone))
+            except (TypeError, ValueError):
+                pass
     return True
 
 
@@ -638,6 +639,17 @@ async def _log_card(title: str, rows: list[str]) -> None:
         pass
 
 
+async def _log_card_job(job_id: str, title: str, rows: list[str]) -> None:
+    """Log a card to the central group AND mirror it to the job's customer PV,
+    so the customer sees per-account events (FloodWait / abandoned account …)
+    of their own multi-send, not just the owner."""
+    await _log_card(title, rows)
+    cust = _job_customer(job_id)
+    if cust and logbus._client is not None:
+        with contextlib.suppress(Exception):
+            await logbus._client.send_message(cust, logbus.card(title, rows))
+
+
 async def _log_error(phone: str, operation: str, exc: BaseException) -> None:
     try:
         await logbus.log_detail("❌ TG MULTI — " + operation, exc,
@@ -718,7 +730,7 @@ async def start(job_id: str) -> dict:
     return status(job_id)
 
 
-async def stop(job_id: str, grace: float = 2.0) -> dict:
+async def stop(job_id: str, grace: float = 3.0) -> dict:
     row = _job(job_id)
     if not row:
         raise KeyError(f"unknown job: {job_id}")
@@ -733,11 +745,23 @@ async def stop(job_id: str, grace: float = 2.0) -> dict:
         task = _TASKS.get(job_id)
     if not task or task.done():
         _pause(job_id)
-    elif grace > 0:
+        return status(job_id)
+    # give the task a moment to stop CLEANLY at its next checkpoint
+    if grace > 0:
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=float(grace))
         except asyncio.TimeoutError:
             pass
+    # still running (stuck in a long send)? cancel it so the account is freed
+    # right away — _run_account's finally releases the busy guard even on cancel,
+    # so a new send isn't wrongly blocked by "یک ارسال دیگه در جریانه".
+    with _TASKS_LOCK:
+        task = _TASKS.get(job_id)
+    if task and not task.done():
+        task.cancel()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(asyncio.shield(task), timeout=6.0)
+    _pause(job_id)
     return status(job_id)
 
 
@@ -1260,13 +1284,13 @@ async def _run_account(job_id: str, account: dict) -> bool:
                         wait = min(int(flood), int(getattr(config, "TG_FLOOD_MAX_WAIT", 300)))
                         temporary = _mark_account_floodwait(job_id, phone, detail, wait, idx)
                         if temporary:
-                            await _log_card("⏳ - اکانت در انتظار FloodWait", [
-                                f"📱 {phone}", f"⏳ {wait} ثانیه صبر",
+                            await _log_card_job(job_id, "⏳ - اکانت در انتظار FloodWait", [
+                                f"📱 {_acckey_phone(phone)}", f"⏳ {wait} ثانیه صبر",
                                 "➡️ بعد از پایان انتظار، مخاطبان باقی‌مانده‌اش دوباره ادامه می‌یابد",
                                 f"🕒 {config.now_str()}"])
                         else:
-                            await _log_card("⛔ - اکانت به‌خاطر FloodWait رها شد", [
-                                f"📱 {phone}", "❌ سقف تکرار FloodWait رد شد",
+                            await _log_card_job(job_id, "⛔ - اکانت به‌خاطر FloodWait رها شد", [
+                                f"📱 {_acckey_phone(phone)}", "❌ سقف تکرار FloodWait رد شد",
                                 "➡️ ادامه با اکانت بعدی", f"🕒 {config.now_str()}"])
                         return True
 
@@ -1310,8 +1334,8 @@ async def _run_account(job_id: str, account: dict) -> bool:
                     if is_restriction and consec >= MAX_CONSECUTIVE_FAILS:
                         reason = f"{MAX_CONSECUTIVE_FAILS} خطای پیاپی محدودیت ({type(exc).__name__})"
                         _mark_account_stopped(job_id, phone, reason, exc)
-                        await _log_card("⛔ - اکانت رها شد (سقف خطا)", [
-                            f"📱 {phone}", f"📛 دلیل: {reason}",
+                        await _log_card_job(job_id, "⛔ - اکانت رها شد (سقف خطا)", [
+                            f"📱 {_acckey_phone(phone)}", f"📛 دلیل: {reason}",
                             "➡️ ادامه با اکانت بعدی", f"🕒 {config.now_str()}"])
                         return True
                     continue

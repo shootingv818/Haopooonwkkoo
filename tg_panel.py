@@ -1268,6 +1268,14 @@ async def tgm_go_cb(event):
         await event.answer("اول از «✍️ محتوا» یک متن یا عکس/فایل تنظیم کن.",
                            alert=True)
         return
+    # finalize any of THIS customer's jobs that are mid-stop, so a fresh send
+    # isn't wrongly blocked by a job that's still settling after a stop.
+    try:
+        for j in multi.list_jobs(customer_id=uid, limit=20):
+            if j.get("state") == "stop_requested":
+                await multi.stop(j["job_id"])
+    except Exception:
+        pass
     # one operation per customer: block if a single send is running on any of
     # this customer's accounts, or the customer already has an active multi job.
     if _customer_active_tg(uid):
@@ -1279,8 +1287,8 @@ async def tgm_go_cb(event):
     except Exception:
         actives = []
     if any(j.get("state") in _MULTI_ACTIVE_STATES for j in actives):
-        await event.answer("یک ارسال چنداکانته‌ی فعال داری. از «📊 وضعیت "
-                           "ارسال‌ها» مدیریتش کن.", alert=True)
+        await event.answer("یک ارسال چنداکانته‌ی فعال داری. اول از «📊 وضعیت "
+                           "ارسال‌ها» متوقفش کن، بعد دوباره بزن.", alert=True)
         return
     await _respond(event, card("📨 تلگرام › ارسال چند اکانته", [
         "⏳ در حال آماده‌سازی مخاطبین هر اکانت (اول دوطرفه‌ها) ..."]))
