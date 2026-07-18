@@ -901,29 +901,27 @@ async def _prepare_content(client: Any, phone: str, content: dict, marker: dict)
 
 async def _send_content(client: Any, target: Any, prepared: list[dict], phone: str,
                         marker: dict, delete_after: bool = False) -> None:
-    sent_ids: list[int] = []
     for item in prepared:
         if not _owns_sender(phone, marker):
             raise SenderOwnershipError("sender ownership changed before delivery")
-        sent = None
         if item["type"] == "media":
             if item["saved"] is not None:
-                sent = await tg.send_saved_media(client, target, item["saved"], item["caption"])
+                await tg.send_saved_media(client, target, item["saved"], item["caption"])
             else:
-                sent = await tg.send_media(client, target, item["path"], item["caption"], typing=0)
+                await tg.send_media(client, target, item["path"], item["caption"], typing=0)
         elif item["text"]:
-            sent = await tg.send_text(client, target, item["text"], typing=0)
-        if sent is not None and getattr(sent, "id", None):
-            sent_ids.append(sent.id)
+            await tg.send_text(client, target, item["text"], typing=0)
         if not _owns_sender(phone, marker):
             raise SenderOwnershipError("sender ownership changed during delivery")
         if len(prepared) > 1:
             await asyncio.sleep(0.05)
-    # One-sided delete: multi-send targets are ALWAYS the account's own private
-    # contacts, so remove only on the sender side (recipient keeps the message).
-    if delete_after and sent_ids:
+    # One-sided CONVERSATION delete: multi-send targets are ALWAYS the account's
+    # own private contacts, so remove the WHOLE dialog from the sender's side
+    # (revoke=False) — the conversation leaves the account's chat list; the
+    # recipient keeps everything.
+    if delete_after:
         with contextlib.suppress(Exception):
-            await client.delete_messages(target, sent_ids, revoke=False)
+            await client.delete_dialog(target, revoke=False)
 
 
 async def _interruptible_sleep(job_id: str, seconds: float) -> bool:
@@ -1107,14 +1105,29 @@ def _live_card_text(job_id: str) -> str:
     return logbus.card("✈️ ارسال چند اکانتی — زنده (اول دوطرفه‌ها)", rows)
 
 
-async def _post_card_to(chat_id, job_id: str, col: str) -> None:
+def _cust_stop_markup(job_id: str):
+    """Inline ⛔ STOP button for the CUSTOMER's live card — shown only while the
+    job is still active, so the customer can stop directly from the card
+    (handled by tg_panel's tgm_stop_ handler)."""
+    row = _job(job_id)
+    if not row or row["state"] not in _ACTIVE_STATES:
+        return None
+    try:
+        from telethon import Button
+        return [[Button.inline("⛔ توقف", f"tgm_stop_{job_id}".encode())]]
+    except Exception:
+        return None
+
+
+async def _post_card_to(chat_id, job_id: str, col: str, buttons=None) -> None:
     """Post the live card to one chat and store its message id in column `col`
     (col is a fixed literal: 'log_msg_id' or 'cust_msg_id')."""
     client = logbus._client
     if client is None or not chat_id:
         return
     try:
-        msg = await client.send_message(int(chat_id), _live_card_text(job_id))
+        msg = await client.send_message(int(chat_id), _live_card_text(job_id),
+                                        buttons=buttons)
     except Exception:
         return
     with contextlib.suppress(Exception):
@@ -1123,7 +1136,7 @@ async def _post_card_to(chat_id, job_id: str, col: str) -> None:
                          (int(getattr(msg, "id", 0) or 0), job_id),)
 
 
-async def _edit_card_to(chat_id, job_id: str, col: str) -> None:
+async def _edit_card_to(chat_id, job_id: str, col: str, buttons=None) -> None:
     """Edit the live card in one chat; post it if we don't have its id yet.
     Silent on 'not modified'/transient errors (never re-spams the chat)."""
     client = logbus._client
@@ -1133,22 +1146,26 @@ async def _edit_card_to(chat_id, job_id: str, col: str) -> None:
         row = conn.execute(f"SELECT {col} FROM tg_multi_jobs WHERE job_id=?", (job_id,)).fetchone()
     msg_id = int(row[col]) if row and row[col] else 0
     if not msg_id:
-        await _post_card_to(chat_id, job_id, col)
+        await _post_card_to(chat_id, job_id, col, buttons=buttons)
         return
     with contextlib.suppress(Exception):
-        await client.edit_message(int(chat_id), msg_id, _live_card_text(job_id))
+        await client.edit_message(int(chat_id), msg_id, _live_card_text(job_id),
+                                  buttons=buttons)
 
 
 async def _post_live_card(job_id: str) -> None:
     await _post_card_to(config.LOG_GROUP_ID, job_id, "log_msg_id")
-    await _post_card_to(_job_customer(job_id), job_id, "cust_msg_id")
+    await _post_card_to(_job_customer(job_id), job_id, "cust_msg_id",
+                        buttons=_cust_stop_markup(job_id))
 
 
 async def _edit_live_card(job_id: str) -> None:
     # mirror to BOTH the central log group AND the customer's own private chat,
     # so the customer sees their multi-send progress just like the single sender.
+    # The customer's card carries a ⛔ stop button while the job is active.
     await _edit_card_to(config.LOG_GROUP_ID, job_id, "log_msg_id")
-    await _edit_card_to(_job_customer(job_id), job_id, "cust_msg_id")
+    await _edit_card_to(_job_customer(job_id), job_id, "cust_msg_id",
+                        buttons=_cust_stop_markup(job_id))
 
 
 async def _ensure_live_card(job_id: str) -> None:

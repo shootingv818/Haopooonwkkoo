@@ -809,10 +809,11 @@ async def tg_delset_cb(event):
         [Button.inline("🔙 تلگرام", b"tg_home")],
     ]
     await _respond(event, card("🧹 تلگرام › پاک‌سازی بعد از ارسال", [
-        f"وضعیت فعلی : {'حذف فقط برای من ✅' if on else 'خاموش'}",
+        f"وضعیت فعلی : {'حذف گفتگو (فقط برای من) ✅' if on else 'خاموش'}",
         LINE,
-        "وقتی روشن باشه، بعد از هر ارسالِ موفق به یک مخاطب، همون پیام فقط از",
-        "چتِ اکانتِ خودت پاک می‌شه — برای گیرنده باقی می‌مونه (حذف یک‌طرفه).",
+        "وقتی روشن باشه، بعد از هر ارسالِ موفق به یک مخاطب، کلِ گفتگو با اون",
+        "مخاطب فقط از سمت اکانت خودت حذف می‌شه و از لیست چت‌هات میره —",
+        "برای گیرنده کاملاً باقی می‌مونه (حذف یک‌طرفهٔ گفتگو).",
         "فقط روی چت‌های خصوصیه؛ گروه/کانال دست‌نخورده می‌مونه.",
         "روی ارسال تکی و چنداکانته، هر دو، اعمال می‌شه.",
     ]), buttons=rows)
@@ -996,13 +997,14 @@ async def _send_one(client, peer, s, prepared_media):
 
 
 async def _delete_own_after(client, peer, sent):
-    """One-sided delete: remove the just-sent message ONLY from the sender
-    account's side (revoke=False). Applied to PRIVATE chats only — group/channel
-    messages are never touched (deleting there would remove it for everyone)."""
+    """One-sided conversation delete: after a successful PRIVATE send, remove the
+    WHOLE conversation with that contact from the SENDER's side only
+    (revoke=False) — the dialog disappears from the account's chat list, while
+    the recipient keeps everything. Groups/channels are never touched."""
     try:
         if sent is None or not getattr(sent, "is_private", False):
             return
-        await client.delete_messages(peer, [sent.id], revoke=False)
+        await client.delete_dialog(peer, revoke=False)
     except Exception:
         pass
 

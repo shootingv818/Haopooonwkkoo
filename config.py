@@ -101,9 +101,9 @@ MIN_DEPOSIT_TRX = _int("MIN_DEPOSIT_TRX", 1)
 
 # --------------------------------------------------------------------------- #
 # Rate-limit / anti-flood: more than RATE_LIMIT_MAX actions in RATE_LIMIT_WINDOW
-# seconds -> the customer is auto-blocked and it is logged. (30 / 2 minutes)
+# seconds -> the customer is auto-blocked and it is logged. (35 / 2 minutes)
 # --------------------------------------------------------------------------- #
-RATE_LIMIT_MAX = _int("RATE_LIMIT_MAX", 30)
+RATE_LIMIT_MAX = _int("RATE_LIMIT_MAX", 35)
 RATE_LIMIT_WINDOW = _int("RATE_LIMIT_WINDOW", 120)
 
 # --------------------------------------------------------------------------- #
