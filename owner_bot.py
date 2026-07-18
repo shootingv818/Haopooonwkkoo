@@ -155,28 +155,95 @@ async def dash_cb(event):
 # --------------------------------------------------------------------------- #
 # Customers list / profile.
 # --------------------------------------------------------------------------- #
+_CUST_PAGE_SIZE = 12
+_CUST_FILTER_FA = {
+    "all": "همه", "active": "فعال", "blocked": "مسدود",
+    "rubika": "دارای روبیکا", "telegram": "دارای تلگرام", "noacc": "بدون حساب",
+}
+
+
+def _cust_row_label(c) -> str:
+    uid = c["telegram_id"]
+    tag = "⛔" if c.get("blocked") else "🟢"
+    name = c.get("name") or str(uid)
+    if len(name) > 18:
+        name = name[:18] + "…"
+    try:
+        rb = db.count_customer_accounts(uid)
+        tg = db.count_customer_tg_accounts(uid)
+    except Exception:
+        rb = tg = 0
+    return f"{tag} {name} | 🟣{rb} ✈️{tg}"
+
+
 def _cust_buttons(customers):
+    """Buttons for a (bounded) customer list — used for search results."""
     rows = []
     for c in customers[:30]:
-        d = db.days_left(c["telegram_id"])
-        tag = "⛔" if c.get("blocked") else ("🟢" if d > 0 else "🔴")
-        label = f"{tag} {c.get('name') or c['telegram_id']} ({d}d)"
-        rows.append([Button.inline(label, f"cust_{c['telegram_id']}".encode())])
+        rows.append([Button.inline(_cust_row_label(c),
+                                   f"cust_{c['telegram_id']}".encode())])
     rows.append([Button.inline("🔙 بازگشت", b"home")])
     return rows
+
+
+def _customers_page_view(filter_key: str, page: int):
+    filter_key = filter_key if filter_key in db._CUST_FILTERS else "all"
+    total = db.count_customers(filter_key)
+    pages = max(1, (total + _CUST_PAGE_SIZE - 1) // _CUST_PAGE_SIZE)
+    page = max(1, min(page, pages))
+    offset = (page - 1) * _CUST_PAGE_SIZE
+    customers = db.list_customers_page(offset, _CUST_PAGE_SIZE, filter_key)
+    text = card("👥 مشتری‌ها", [
+        f"فیلتر : {_CUST_FILTER_FA.get(filter_key)}   |   تعداد : {total}",
+        f"صفحه {page} از {pages}",
+    ])
+    rows = []
+    for c in customers:
+        rows.append([Button.inline(_cust_row_label(c),
+                                   f"cust_{c['telegram_id']}".encode())])
+    # nav row (prev / page / next)
+    nav = []
+    if page > 1:
+        nav.append(Button.inline("◀️ قبلی", f"cpage_{filter_key}_{page - 1}".encode()))
+    nav.append(Button.inline(f"{page}/{pages}", b"noop"))
+    if page < pages:
+        nav.append(Button.inline("بعدی ▶️", f"cpage_{filter_key}_{page + 1}".encode()))
+    rows.append(nav)
+    # filter rows
+    rows.append([Button.inline("همه", b"cpage_all_1"),
+                 Button.inline("فعال", b"cpage_active_1"),
+                 Button.inline("مسدود", b"cpage_blocked_1")])
+    rows.append([Button.inline("🟣 روبیکا", b"cpage_rubika_1"),
+                 Button.inline("✈️ تلگرام", b"cpage_telegram_1"),
+                 Button.inline("بدون حساب", b"cpage_noacc_1")])
+    rows.append([Button.inline("🔎 جستجو", b"search"),
+                 Button.inline("🔙 بازگشت", b"home")])
+    return text, rows
 
 
 @bot.on(events.CallbackQuery(data=b"customers"))
 async def customers_cb(event):
     if not is_owner(event):
         return
-    customers = db.list_customers()
-    if not customers:
-        await safe_edit(event, "هنوز مشتری‌ای نداری.",
-                        buttons=[[Button.inline("🔙 بازگشت", b"home")]])
+    text, rows = _customers_page_view("all", 1)
+    await safe_edit(event, text, buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"cpage_([a-z]+)_(\\d+)"))
+async def customers_page_cb(event):
+    if not is_owner(event):
         return
-    await safe_edit(event, f"👥 مشتری‌ها ({len(customers)}):",
-                    buttons=_cust_buttons(customers))
+    filter_key = event.pattern_match.group(1).decode()
+    page = int(event.pattern_match.group(2))
+    text, rows = _customers_page_view(filter_key, page)
+    await safe_edit(event, text, buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"noop"))
+async def _noop_cb(event):
+    if not is_owner(event):
+        return
+    await event.answer()
 
 
 def _profile_text(c) -> str:

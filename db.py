@@ -380,13 +380,53 @@ def list_customers() -> list:
 
 
 def search_customers(term: str) -> list:
+    """Search customers by telegram_id / name / username, AND by any of their
+    Rubika or Telegram account phone numbers."""
     term = (term or "").strip()
     like = f"%{term}%"
     conn = _conn()
     rows = conn.execute(
         "SELECT * FROM customers WHERE CAST(telegram_id AS TEXT) LIKE ? "
-        "OR name LIKE ? OR username LIKE ? ORDER BY created_at",
-        (like, like, like),
+        "OR name LIKE ? OR username LIKE ? "
+        "OR telegram_id IN (SELECT customer_id FROM accounts WHERE phone LIKE ?) "
+        "OR telegram_id IN (SELECT customer_id FROM tg_accounts WHERE phone LIKE ?) "
+        "ORDER BY created_at",
+        (like, like, like, like, like),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------------------------- #
+# Paginated + filtered customer browsing (owner panel, scales to 500+ users).
+# Only the requested page is read from the DB; counts use COUNT(*). Filters are
+# expressed in SQL so no full-table Python scan is needed.
+# --------------------------------------------------------------------------- #
+_CUST_FILTERS = {
+    "all": "",
+    "active": "WHERE c.blocked = 0",
+    "blocked": "WHERE c.blocked = 1",
+    "rubika": "WHERE EXISTS (SELECT 1 FROM accounts a WHERE a.customer_id = c.telegram_id)",
+    "telegram": "WHERE EXISTS (SELECT 1 FROM tg_accounts t WHERE t.customer_id = c.telegram_id)",
+    "noacc": ("WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.customer_id = c.telegram_id) "
+              "AND NOT EXISTS (SELECT 1 FROM tg_accounts t WHERE t.customer_id = c.telegram_id)"),
+}
+
+
+def count_customers(filter_key: str = "all") -> int:
+    where = _CUST_FILTERS.get(filter_key, "")
+    conn = _conn()
+    n = conn.execute(f"SELECT COUNT(*) AS n FROM customers c {where}").fetchone()["n"]
+    conn.close()
+    return int(n)
+
+
+def list_customers_page(offset: int, limit: int, filter_key: str = "all") -> list:
+    where = _CUST_FILTERS.get(filter_key, "")
+    conn = _conn()
+    rows = conn.execute(
+        f"SELECT * FROM customers c {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (int(limit), int(offset)),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
