@@ -202,6 +202,32 @@ def _sub_line(uid: int) -> str:
     return f"🟢 {d} روز از اشتراک شما باقی مونده."
 
 
+def _account_stats_line(uid: int) -> str:
+    """Short per-customer account + send-count summary shown at the top of the
+    root panel (Rubika and Telegram, this customer only)."""
+    try:
+        cust = db.get_customer(uid) or {}
+        rb_acc = db.count_customer_accounts(uid)
+        rb_send = int(cust.get("total_sends") or 0)
+        tg_acc = db.count_customer_tg_accounts(uid)
+        tg_send = int((db.get_tg_settings(uid) or {}).get("total_sends") or 0)
+    except Exception:
+        return ""
+    return (f"🟣 روبیکا: {rb_acc} اکانت | 🚀 {rb_send}\n"
+            f"✈️ تلگرام: {tg_acc} اکانت | 🚀 {tg_send}")
+
+
+def _root_text(uid: int) -> str:
+    """Root panel text: access line + this customer's account/send stats."""
+    header = _sub_line(uid)
+    stats = _account_stats_line(uid)
+    body = f"🤖 پنل ربات\n{LINE}\n{header}"
+    if stats:
+        body += f"\n{stats}"
+    body += "\n\nکدوم بخش؟ 📨 تلگرام یا 🟣 روبیکا:"
+    return body
+
+
 def root_menu():
     """Root: Rubika + Telegram side by side."""
     return [
@@ -344,11 +370,7 @@ async def start_handler(event):
         ("🆕 مشتری جدید" if fresh else "↩️ بازگشت مشتری"),
         f"🕒 {now()}"])
 
-    header = _sub_line(uid)
-    await event.respond(
-        f"🤖 پنل ربات\n{LINE}\n{header}\n\n"
-        "کدوم بخش؟ 📨 تلگرام یا 🟣 روبیکا:",
-        buttons=root_menu())
+    await event.respond(_root_text(uid), buttons=root_menu())
 
 
 @bot.on(events.CallbackQuery(data=b"mainmenu"))
@@ -356,10 +378,7 @@ async def mainmenu_cb(event):
     if not await _gate(event, need_active=False, count_action=False):
         return
     state.pop(event.sender_id, None)
-    header = _sub_line(event.sender_id)
-    await _respond(event, f"🤖 پنل ربات\n{LINE}\n{header}\n\n"
-                          "کدوم بخش؟ 📨 تلگرام یا 🟣 روبیکا:",
-                   buttons=root_menu())
+    await _respond(event, _root_text(event.sender_id), buttons=root_menu())
 
 
 @bot.on(events.CallbackQuery(data=b"rubika_open"))
@@ -398,10 +417,7 @@ async def fj_check_cb(event):
     await event.answer("✅ عضو شدی! خوش اومدی.")
     state.pop(uid, None)
     tg_panel._state.pop(uid, None)
-    header = _sub_line(uid)
-    await _respond(event, f"🤖 پنل ربات\n{LINE}\n{header}\n\n"
-                          "کدوم بخش؟ 🟣 روبیکا / 📨 تلگرام:",
-                   buttons=root_menu())
+    await _respond(event, _root_text(uid), buttons=root_menu())
 
 
 @bot.on(events.CallbackQuery(data=b"cancel"))
