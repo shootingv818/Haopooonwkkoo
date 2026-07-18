@@ -281,9 +281,14 @@ async def update_worker(worker: dict) -> tuple:
     conn = await _with_conn(worker)
     try:
         br = config.GIT_BRANCH
+        repo = config.GIT_REPO_URL
         cmd = (
             f"cd {REMOTE_DIR} && "
-            f"git fetch origin {br} && "
+            # Repoint origin to the CURRENT repo first, so a worker cloned from
+            # an older repo/branch is moved onto the active code with one click
+            # from the panel (no manual SSH per worker ever again).
+            f"git remote set-url origin '{repo}' && "
+            f"git fetch --depth 1 origin {br} && "
             f"git checkout -B {br} FETCH_HEAD && "
             f"docker build --network=host -t {IMAGE} . && "
             f"(docker rm -f {CONTAINER} 2>/dev/null || true) && "
