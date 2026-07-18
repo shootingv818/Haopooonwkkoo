@@ -40,6 +40,7 @@ import group_panel
 import forcedjoin
 import tron
 import worker
+import worker_transfer
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -1212,6 +1213,9 @@ async def _rubika_post_add(uid, aid, phone, w):
 
     buttons = None
     if res.get("ok") and too == 0 and sent > 0:
+        # Server is healthy for this account -> reset the transfer chain so a
+        # future problem starts trying workers fresh.
+        worker_transfer.clear_tried(aid)
         text = card("✅ تستِ ارسال موفق", [
             f"📱 {phone}", f"✅ {sent} ارسالِ موفق",
             "این سرور برای ارسال سالمه.",
@@ -1279,16 +1283,24 @@ async def rbxfer_cb(event):
         return
     old_w = worker.worker_for_account(acc)
     old_id = old_w.get("id") if old_w else None
+    # Remember the CURRENT (failed) worker so repeated transfers never land back
+    # on a worker already tried for THIS account. pick_worker_for_transfer then
+    # excludes the FULL tried set, always moving forward to an untried worker.
+    worker_transfer.add_tried(aid, old_id)
+    tried = worker_transfer.get_tried(aid)
     try:
-        new_w = await worker.pick_worker_for_login(exclude_id=old_id)
+        new_w = await worker_transfer.pick_worker_for_transfer(exclude_ids=tried)
     except Exception:  # noqa: BLE001
         new_w = None
     if not new_w:
         await _respond(event, card("🔄 انتقال به ورکر دیگه", [
-            "الان ورکرِ سالمِ دیگه‌ای برای انتقال نیست.",
+            "همهٔ ورکرهای سالم قبلاً برای این اکانت امتحان شدن،",
+            "یا الان ورکرِ سالمِ دیگه‌ای برای انتقال نیست.",
             "اول یه ورکرِ دیگه (مثلاً با آی‌پی ایران) اضافه کن."]),
             buttons=[[Button.inline("🔙 بازگشت", b"home")]])
         return
+    # Mark the new target tried as well (so the next transfer skips it too).
+    worker_transfer.add_tried(aid, new_w.get("id"))
     phone = acc["phone"]
     # delete the OLD worker's session so it can never use this account again
     try:
@@ -1401,6 +1413,7 @@ async def del_do_cb(event):
     except Exception:
         pass
     db.delete_account(aid)
+    worker_transfer.clear_tried(aid)   # drop any transfer history for this account
     await _respond(event, "اکانت حذف شد. ✅",
                    buttons=[[Button.inline("🔙 بازگشت", b"accounts")]])
 
