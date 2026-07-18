@@ -60,6 +60,9 @@ _pending: dict = {}
 _stop: dict = {}
 # account_ids currently sending (avoid double-enqueue)
 _active: set = set()
+# Contacts-export stop flags + active guard: account_id -> True / {account_id}
+_export_stop: dict = {}
+_export_active: set = set()
 # reference to customer_bot's Rubika conversation-state dict (set in setup), so
 # entering the Telegram section can clear any half-finished Rubika flow and vice
 # versa — prevents BOTH NewMessage routers acting on the same message.
@@ -435,6 +438,7 @@ async def tg_acc_cb(event):
         f"⭐️ وضعیت : {status}",
     ]), buttons=[
         [Button.inline("🚀 شروع ارسال", f"tg_send_{account_id}".encode())],
+        [Button.inline("📥 دریافت مخاطبان TXT", f"tg_ct_{account_id}".encode())],
         [Button.inline("🩺 چک‌حساب", f"tg_chk_{account_id}".encode()),
          Button.inline("🗑 حذف", f"tg_del_{account_id}".encode())],
         [Button.inline("🔙 اکانت‌ها", b"tg_accounts")],
@@ -465,6 +469,135 @@ async def tg_delyes_cb(event):
                    buttons=[[Button.inline("🔙 اکانت‌ها", b"tg_accounts")]])
     await logbus.event("🗑 TG DELETE ACCOUNT", [
         f"🆔 {uid}", f"📱 {acc['phone']}", f"🕒 {now()}"], pv_user=uid)
+
+
+# --------------------------------------------------------------------------- #
+# Contacts export (TXT: phone numbers only, in order) — per account, stoppable.
+# --------------------------------------------------------------------------- #
+def _mask_phone(phone) -> str:
+    p = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if len(p) <= 7:
+        return "***"
+    return f"{p[:5]}***{p[-3:]}"
+
+
+async def tg_ct_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    account_id = int(event.pattern_match.group(1))
+    acc = db.get_tg_account_owned(account_id, uid)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    if account_id in _export_active:
+        await event.answer("همین حالا در حال گرفتن مخاطبین این اکانته.", alert=True)
+        return
+    if account_id in _active:
+        await event.answer("این اکانت همین الان در حال ارساله؛ بعد از اتمام دوباره بزن.",
+                           alert=True)
+        return
+    # hold both the export guard AND the send-busy guard so a send can't open a
+    # second connection on the same session while we export (Telegram would
+    # revoke it).
+    _export_active.add(account_id)
+    _active.add(account_id)
+    _export_stop.pop(account_id, None)
+    pm = await bot.send_message(uid, card("📥 تلگرام › دریافت مخاطبان", [
+        f"📱 {acc['phone']}", "⏳ در حال آماده‌سازی ..."]),
+        buttons=[[Button.inline("⛔ توقف", f"tg_ctstop_{account_id}".encode())]])
+    await event.answer("شروع شد.")
+    asyncio.create_task(_run_contacts_export(uid, account_id, pm.id))
+
+
+async def tg_ctstop_cb(event):
+    account_id = int(event.pattern_match.group(1))
+    _export_stop[account_id] = True
+    await event.answer("درخواست توقف ثبت شد.", alert=True)
+
+
+async def _run_contacts_export(uid, account_id, msg_id):
+    acc = db.get_tg_account_owned(account_id, uid)
+    if not acc:
+        _export_active.discard(account_id)
+        _active.discard(account_id)
+        return
+    back = [[Button.inline("🔙 اکانت", f"tg_acc_{account_id}".encode())]]
+    client = TelegramClient(StringSession(acc.get("session") or ""),
+                            config.API_ID, config.API_HASH)
+    path = os.path.join(TG_MEDIA_DIR,
+                        f"contacts_{uid}_{account_id}_{os.urandom(6).hex()}.txt")
+    numbers = []
+    stopped = False
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            db.set_tg_status(account_id, "dead")
+            await _safe_edit(uid, msg_id, card("⚠️ اکانت در دسترس نیست", [
+                f"📱 {acc['phone']}", "سشن باطل/خارج‌شده. دوباره اضافه‌اش کن."]),
+                buttons=back)
+            return
+        result = await client(GetContactsRequest(hash=0))
+        users = list(getattr(result, "users", []) or [])
+        total = len(users)
+        seen = set()
+        last_edit = 0.0
+        for i, u in enumerate(users, 1):
+            if _export_stop.get(account_id):
+                stopped = True
+                break
+            ph = "".join(ch for ch in (getattr(u, "phone", "") or "") if ch.isdigit())
+            if ph and ph not in seen:
+                seen.add(ph)
+                numbers.append(ph)
+            t = _time.time()
+            if t - last_edit >= 2:
+                last_edit = t
+                await _safe_edit(uid, msg_id, card("📥 تلگرام › دریافت مخاطبان", [
+                    f"📱 {acc['phone']}", f"🔢 پردازش‌شده : {i}/{total}",
+                    f"✅ شماره‌ها : {len(numbers)}"]),
+                    buttons=[[Button.inline("⛔ توقف",
+                                            f"tg_ctstop_{account_id}".encode())]])
+        if stopped:
+            await _safe_edit(uid, msg_id, card("⛔ متوقف شد", [
+                f"📱 {acc['phone']}", "دریافت مخاطبین متوقف شد. فایلی ارسال نشد."]),
+                buttons=back)
+            await logbus.event("⛔ TG CONTACTS EXPORT STOP", [
+                f"🆔 {uid}", f"📱 {_mask_phone(acc['phone'])}",
+                f"🔢 قبل از توقف : {len(numbers)}", f"🕒 {now()}"], pv_user=uid)
+            return
+        if not numbers:
+            await _safe_edit(uid, msg_id, card("📥 مخاطبی یافت نشد", [
+                f"📱 {acc['phone']}", "شماره‌ای برای خروجی نبود."]), buttons=back)
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(numbers) + "\n")
+        await bot.send_file(uid, path, caption=card("📥 مخاطبان تلگرام", [
+            f"📱 {acc['phone']}", f"🔢 تعداد شماره : {len(numbers)}"]),
+            force_document=True)
+        await _safe_edit(uid, msg_id, card("✅ فایل مخاطبان ارسال شد", [
+            f"📱 {acc['phone']}", f"🔢 {len(numbers)} شماره"]), buttons=back)
+        await logbus.event("📥 TG CONTACTS EXPORT", [
+            f"🆔 {uid}", f"📱 {_mask_phone(acc['phone'])}",
+            f"🔢 تعداد : {len(numbers)}", f"🕒 {now()}"], pv_user=uid)
+    except Exception as e:  # noqa: BLE001
+        await logbus.log_detail("❌ TG CONTACTS EXPORT ERROR", e,
+                                [f"🆔 {uid}", f"📱 {_mask_phone(acc.get('phone'))}"])
+        await _safe_edit(uid, msg_id, card("❌ خطا", [
+            logbus.humanize_error(e, "generic")]), buttons=back)
+    finally:
+        _export_stop.pop(account_id, None)
+        _export_active.discard(account_id)
+        _active.discard(account_id)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1316,6 +1449,8 @@ def setup(shared_bot, rubika_state=None):
     add(tg_delyes_cb, events.CallbackQuery(pattern=b"tg_delyes_(\\d+)"))
     add(tg_health_cb, events.CallbackQuery(data=b"tg_health"))
     add(tg_chk_cb, events.CallbackQuery(pattern=b"tg_chk_(\\d+)"))
+    add(tg_ct_cb, events.CallbackQuery(pattern=b"tg_ct_(\\d+)"))
+    add(tg_ctstop_cb, events.CallbackQuery(pattern=b"tg_ctstop_(\\d+)"))
     add(tg_content_cb, events.CallbackQuery(data=b"tg_content"))
     add(tg_speed_cb, events.CallbackQuery(data=b"tg_speed"))
     add(tg_spd_cb, events.CallbackQuery(pattern=b"tg_spd_([0-9.]+)"))
