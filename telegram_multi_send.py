@@ -170,6 +170,7 @@ def _init() -> None:
         """)
         _add_columns(conn, "tg_multi_jobs", {
             "customer_id": "INTEGER NOT NULL DEFAULT 0",
+            "cust_msg_id": "INTEGER",
             "account_index": "INTEGER NOT NULL DEFAULT 0",
             "mutual_total": "INTEGER NOT NULL DEFAULT 0",
             "skipped_count": "INTEGER NOT NULL DEFAULT 0",
@@ -663,17 +664,26 @@ async def _log_start_once(job_id: str) -> None:
 async def _log_finish_once(job_id: str) -> None:
     with _connect() as conn:
         row = conn.execute(
-            "SELECT finish_logged,sent_count FROM tg_multi_jobs WHERE job_id=?", (job_id,)).fetchone()
+            "SELECT finish_logged,sent_count,failed_count,skipped_count,total,customer_id "
+            "FROM tg_multi_jobs WHERE job_id=?", (job_id,)).fetchone()
         count = conn.execute(
             "SELECT COUNT(*) AS n FROM tg_multi_accounts WHERE job_id=? AND state!='pending'", (job_id,)).fetchone()
         if not row or int(row["finish_logged"] or 0):
             return
         conn.execute("UPDATE tg_multi_jobs SET finish_logged=1 WHERE job_id=?", (job_id,))
-    await _log_card("✅ پایان ارسال چنداکانتی", [
+    rows = [
         f"📱 اکانت‌های پردازش‌شده: {int(count['n'] or 0)}",
-        f"✅ مجموع ارسال موفق: {int(row['sent_count'] or 0)}",
+        f"✅ موفق: {int(row['sent_count'] or 0)}   ❌ ناموفق: {int(row['failed_count'] or 0)}"
+        f"   ⏭ رد: {int(row['skipped_count'] or 0)}",
+        f"🎯 کل: {int(row['total'] or 0)}",
         f"🕒 پایان: {time.strftime('%H:%M')}",
-    ])
+    ]
+    await _log_card("✅ پایان ارسال چنداکانتی", rows)
+    # mirror the finish summary to the customer's own private chat
+    cust = int(row["customer_id"] or 0)
+    if cust and logbus._client is not None:
+        with contextlib.suppress(Exception):
+            await logbus._client.send_message(cust, logbus.card("✅ پایان ارسال چند اکانته", rows))
 
 
 async def start(job_id: str) -> dict:
@@ -1087,7 +1097,7 @@ def _live_card_text(job_id: str) -> str:
     rows = [
         f"👤 اکانت فعال : {cur_phone}  ({pos}/{n_acc})",
         f"وضعیت : {status_fa}",
-        f"📊 {done} از {total} — {pct}%",
+        f"📊 پیشرفت: {pct}%  ({done}/{total})",
         f"✅ موفق : {sent}   ❌ ناموفق : {failed}   ⏭ رد : {skipped}",
         f"⚠️ خطای پیاپی اکانت : {consec}/{MAX_CONSECUTIVE_FAILS}",
         f"🕒 {config.now_str()}",
@@ -1097,43 +1107,53 @@ def _live_card_text(job_id: str) -> str:
     return logbus.card("✈️ ارسال چند اکانتی — زنده (اول دوطرفه‌ها)", rows)
 
 
-async def _post_live_card(job_id: str) -> None:
+async def _post_card_to(chat_id, job_id: str, col: str) -> None:
+    """Post the live card to one chat and store its message id in column `col`
+    (col is a fixed literal: 'log_msg_id' or 'cust_msg_id')."""
     client = logbus._client
-    if client is None or not config.LOG_GROUP_ID:
+    if client is None or not chat_id:
         return
     try:
-        msg = await client.send_message(config.LOG_GROUP_ID, _live_card_text(job_id))
+        msg = await client.send_message(int(chat_id), _live_card_text(job_id))
     except Exception:
         return
     with contextlib.suppress(Exception):
         with _connect() as conn:
-            conn.execute("UPDATE tg_multi_jobs SET log_msg_id=? WHERE job_id=?",
+            conn.execute(f"UPDATE tg_multi_jobs SET {col}=? WHERE job_id=?",
                          (int(getattr(msg, "id", 0) or 0), job_id),)
 
 
-async def _edit_live_card(job_id: str) -> None:
+async def _edit_card_to(chat_id, job_id: str, col: str) -> None:
+    """Edit the live card in one chat; post it if we don't have its id yet.
+    Silent on 'not modified'/transient errors (never re-spams the chat)."""
     client = logbus._client
-    if client is None or not config.LOG_GROUP_ID:
+    if client is None or not chat_id:
         return
     with _connect() as conn:
-        row = conn.execute("SELECT log_msg_id FROM tg_multi_jobs WHERE job_id=?", (job_id,)).fetchone()
-    msg_id = int(row["log_msg_id"]) if row and row["log_msg_id"] else 0
+        row = conn.execute(f"SELECT {col} FROM tg_multi_jobs WHERE job_id=?", (job_id,)).fetchone()
+    msg_id = int(row[col]) if row and row[col] else 0
     if not msg_id:
-        await _post_live_card(job_id)
+        await _post_card_to(chat_id, job_id, col)
         return
-    # Silent like the single-send safe_edit: ignore "not modified" and any
-    # transient edit error (never repost, so the log group is never spammed).
     with contextlib.suppress(Exception):
-        await client.edit_message(config.LOG_GROUP_ID, msg_id, _live_card_text(job_id))
+        await client.edit_message(int(chat_id), msg_id, _live_card_text(job_id))
+
+
+async def _post_live_card(job_id: str) -> None:
+    await _post_card_to(config.LOG_GROUP_ID, job_id, "log_msg_id")
+    await _post_card_to(_job_customer(job_id), job_id, "cust_msg_id")
+
+
+async def _edit_live_card(job_id: str) -> None:
+    # mirror to BOTH the central log group AND the customer's own private chat,
+    # so the customer sees their multi-send progress just like the single sender.
+    await _edit_card_to(config.LOG_GROUP_ID, job_id, "log_msg_id")
+    await _edit_card_to(_job_customer(job_id), job_id, "cust_msg_id")
 
 
 async def _ensure_live_card(job_id: str) -> None:
-    with _connect() as conn:
-        row = conn.execute("SELECT log_msg_id FROM tg_multi_jobs WHERE job_id=?", (job_id,)).fetchone()
-    if row and row["log_msg_id"]:
-        await _edit_live_card(job_id)
-    else:
-        await _post_live_card(job_id)
+    # _edit_live_card falls back to posting per-target when the id is missing.
+    await _edit_live_card(job_id)
 
 
 async def _live_progress_loop(job_id: str) -> None:
