@@ -601,6 +601,74 @@ async def _read_remote_file(sftp, path: str) -> bytes:
         return await f.read()
 
 
+async def _collect_one_worker_sessions(w, prefix: str):
+    """Return (files, reachable) for ONE remote worker. files is a list of
+    (arcname, bytes). reachable is False if we couldn't connect at all."""
+    files = []
+    try:
+        conn = await _with_conn(w)
+    except Exception:
+        return files, False
+    reachable = True
+    try:
+        sftp = await conn.start_sftp_client()
+        remote_sessions = f"{REMOTE_DATA}/sessions"
+        try:
+            names = await sftp.listdir(remote_sessions)
+        except Exception:
+            names = []
+        safe_tag = str(w.get("tag") or w.get("id") or "w").replace("#", "").replace("/", "_")
+        for name in names:
+            if name in (".", ".."):
+                continue
+            try:
+                data = await _read_remote_file(sftp, f"{remote_sessions}/{name}")
+                files.append((f"{prefix}/{safe_tag}/{name}", data))
+            except Exception:
+                continue
+    except Exception:
+        reachable = False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return files, reachable
+
+
+async def collect_worker_sessions(prefix: str = "rubika/workers", concurrency: int = 4):
+    """Fetch every non-master worker's Rubika session files IN PARALLEL (bounded
+    by ``concurrency``). Returns (files, unreachable_tags) where files is a list
+    of (arcname, bytes). Best-effort; never raises out. Used by the session-only
+    backup — provisioning/routing are untouched."""
+    try:
+        import asyncssh  # noqa: F401
+    except ImportError:
+        return [], []
+    workers = [w for w in db.list_workers() if not is_local(w)]
+    if not workers:
+        return [], []
+    sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+    async def _guarded(w):
+        async with sem:
+            return w, await _collect_one_worker_sessions(w, prefix)
+
+    results = await asyncio.gather(*[_guarded(w) for w in workers],
+                                   return_exceptions=True)
+    files = []
+    unreachable = []
+    for r in results:
+        if isinstance(r, Exception):
+            continue
+        w, (flist, reachable) = r
+        if reachable:
+            files.extend(flist)
+        else:
+            unreachable.append(str(w.get("tag") or w.get("id")))
+    return files, unreachable
+
+
 async def shutdown():
     """Close all open tunnels (call on master shutdown)."""
     for wid in list(_tunnels.keys()):

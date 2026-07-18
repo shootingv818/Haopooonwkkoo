@@ -24,8 +24,6 @@ audit log.
 """
 import asyncio
 import os
-import time
-import zipfile
 
 from telethon import TelegramClient, events, Button
 
@@ -626,8 +624,8 @@ async def sys_cb(event):
         f"💾 آخرین بکاپ : {last}",
     ]), buttons=[
         [Button.inline("🛠 تغییر حالت تعمیر", b"maint_toggle")],
-        [Button.inline("💾 بکاپ فوری", b"backup_now")],
-        [Button.inline("🗄 بکاپ کامل (سشن+محتوا+تنظیمات)", b"fullbackup")],
+        [Button.inline("💾 بکاپ سشن‌ها (گروه لاگ)", b"backup_now")],
+        [Button.inline("🗄 بکاپ سشن‌ها (خصوصی)", b"fullbackup")],
         [Button.inline("🔙 بازگشت", b"home")]])
 
 
@@ -694,54 +692,15 @@ async def tg_owner_cb(event):
                              [Button.inline("🔙 بازگشت", b"home")]])
 
 
-async def _build_full_backup() -> str:
-    """Zip EVERYTHING the owner needs to restore: the customer DB (rubika+tg
-    accounts, customers, content/settings), the central DB, the local media +
-    session files, AND every remote worker's session files. Returns the path."""
-    out = os.path.join(DATA_DIR, f"full_backup_{int(time.time())}.zip")
-    db_paths = [getattr(db, "DB_PATH", None), getattr(central_db, "DB_PATH", None)]
-    dirs = [os.path.join(DATA_DIR, "sessions"), os.path.join(DATA_DIR, "tg_media")]
-    zf = zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED)
-    try:
-        for p in db_paths:
-            if p and os.path.exists(p):
-                zf.write(p, os.path.basename(p))
-        for d in dirs:
-            if os.path.isdir(d):
-                for root, _dirs, files in os.walk(d):
-                    for f in files:
-                        fp = os.path.join(root, f)
-                        zf.write(fp, os.path.relpath(fp, DATA_DIR))
-        # pull every remote worker's Rubika session files into the archive too
-        try:
-            await worker.collect_sessions_into_zip(zf)
-        except Exception as e:  # noqa: BLE001
-            await logbus.to_group(f"⚠️ بکاپ سشن ورکرها ناقص ماند: {repr(e)[:150]}")
-    finally:
-        zf.close()
-    return out
-
-
 @bot.on(events.CallbackQuery(data=b"fullbackup"))
 async def fullbackup_cb(event):
     if not is_owner(event):
         return
-    await event.answer("در حال ساخت بکاپ کامل ...")
-    path = None
-    try:
-        path = await _build_full_backup()
-        await bot.send_file(event.sender_id, path,
-                            caption=f"🗄 بکاپ کامل (سشن + محتوا + تنظیمات) • {now()}",
-                            force_document=True)
-        await logbus.to_group(card("🗄 FULL BACKUP", [f"🕒 {now()}"]))
-    except Exception as e:  # noqa: BLE001
-        await bot.send_message(event.sender_id, f"❌ خطا در بکاپ کامل: {repr(e)[:140]}")
-    finally:
-        if path and os.path.exists(path):
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+    await event.answer("در حال ساخت بکاپ سشن‌ها ...")
+    # session-only backup, sent privately to the owner (and the log group).
+    ok = await backup.run_backup(to_owner=event.sender_id)
+    if not ok:
+        await bot.send_message(event.sender_id, "سشنی برای بکاپ نیست.")
 
 
 # --------------------------------------------------------------------------- #

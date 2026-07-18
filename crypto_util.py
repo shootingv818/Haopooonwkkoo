@@ -65,6 +65,18 @@ def decrypt(token: str) -> str:
     return _fernet().decrypt(token.encode()).decode()
 
 
+def encrypt_bytes(data: bytes) -> bytes:
+    """Encrypt raw bytes (e.g. a backup archive) -> Fernet token bytes."""
+    return _fernet().encrypt(data or b"")
+
+
+def decrypt_bytes(token: bytes) -> bytes:
+    """Decrypt bytes produced by encrypt_bytes()."""
+    if not token:
+        return b""
+    return _fernet().decrypt(token)
+
+
 def is_configured() -> bool:
     """True if a usable WORKER_SECRET is present (no exception on build)."""
     try:
