@@ -650,6 +650,31 @@ async def _log_card_job(job_id: str, title: str, rows: list[str]) -> None:
             await logbus._client.send_message(cust, logbus.card(title, rows))
 
 
+async def _log_account_done(job_id: str, phone: str, headline: str,
+                            extra: list[str] | None = None) -> None:
+    """Post a per-account 'this account's turn ended → moving to the next' card
+    to the log group AND the customer's PV, for EVERY reason a turn ends
+    (finished all contacts, sent nothing, abandoned, auth/connection error).
+    FloodWait keeps its own dedicated cards. This never fires per-recipient, so
+    it informs the customer of the account rotation without spamming."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT sent_count,failure_count,total FROM tg_multi_accounts "
+            "WHERE job_id=? AND phone=?", (job_id, phone)).fetchone()
+    sent = int(row["sent_count"] or 0) if row else 0
+    failed = int(row["failure_count"] or 0) if row else 0
+    total = int(row["total"] or 0) if row else 0
+    rows = [
+        f"📱 {_acckey_phone(phone)}",
+        f"✅ موفق: {sent}   ❌ ناموفق: {failed}   🎯 کل: {total}",
+    ]
+    if extra:
+        rows.extend(extra)
+    rows.append("➡️ رفتن به اکانت بعدی")
+    rows.append(f"🕒 {config.now_str()}")
+    await _log_card_job(job_id, headline, rows)
+
+
 async def _log_error(phone: str, operation: str, exc: BaseException) -> None:
     try:
         await logbus.log_detail("❌ TG MULTI — " + operation, exc,
@@ -1227,6 +1252,8 @@ async def _run_account(job_id: str, account: dict) -> bool:
             exc = RuntimeError("ordinary Telegram send is active on this account")
             await _log_error(phone, "شروع نوبت اکانت", exc)
             _mark_account_stopped(job_id, phone, str(exc), exc)
+            await _log_account_done(job_id, phone,
+                                    "⛔ اکانت رد شد (ارسال عادی روی این اکانت فعال بود)")
             return True
         client = None
         try:
@@ -1245,10 +1272,13 @@ async def _run_account(job_id: str, account: dict) -> bool:
                     exc = RuntimeError("sender ownership changed while account was running")
                     await _log_error(phone, "تداخل با ارسال عادی", exc)
                     _mark_account_stopped(job_id, phone, str(exc), exc)
+                    await _log_account_done(job_id, phone,
+                                            "⛔ اکانت متوقف شد (تداخل با ارسال عادی)")
                     return True
                 recipient = _next_recipient(job_id, phone)
                 if not recipient:
                     _mark_account_completed(job_id, phone)
+                    await _log_account_done(job_id, phone, "✅ اکانت کامل شد")
                     return True
                 idx = int(recipient["idx"])
                 if not _claim(job_id, idx, phone):
@@ -1299,6 +1329,9 @@ async def _run_account(job_id: str, account: dict) -> bool:
                     if _hard_account_failure(exc):
                         await _log_error(phone, "ارسال (خطای اتصال/دسترسی اکانت)", exc)
                         _mark_account_stopped(job_id, phone, detail, exc, idx)
+                        await _log_account_done(job_id, phone,
+                                                "⛔ اکانت متوقف شد (خطای اتصال/دسترسی)",
+                                                [f"📛 {detail}"])
                         return True
 
                     # 3) Per-recipient failure. Restriction errors (PeerFlood /
@@ -1375,6 +1408,9 @@ async def _run_account(job_id: str, account: dict) -> bool:
             detail = f"{type(exc).__name__}: {str(exc)[:180]}"
             await _log_error(phone, "اتصال/آماده‌سازی اکانت", exc)
             _mark_account_stopped(job_id, phone, detail, exc)
+            await _log_account_done(job_id, phone,
+                                    "⛔ اکانت متوقف شد (خطای آماده‌سازی/اتصال)",
+                                    [f"📛 {detail}"])
             return True
         finally:
             await _release_and_drop_sender(phone, marker)

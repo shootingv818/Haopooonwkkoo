@@ -63,6 +63,9 @@ _active: set = set()
 # Contacts-export stop flags + active guard: account_id -> True / {account_id}
 _export_stop: dict = {}
 _export_active: set = set()
+# "My accounts" list pagination: uid -> current page index
+_acc_page: dict = {}
+_ACC_PAGE_SIZE = 15
 # reference to customer_bot's Rubika conversation-state dict (set in setup), so
 # entering the Telegram section can clear any half-finished Rubika flow and vice
 # versa — prevents BOTH NewMessage routers acting on the same message.
@@ -402,6 +405,23 @@ async def tg_accounts_cb(event):
     if not await _gate(event):
         return
     uid = event.sender_id
+    _acc_page[uid] = 0                         # always open on the first page
+    await _render_accounts(event, uid)
+
+
+async def tg_apage_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    try:
+        page = int(event.pattern_match.group(1).decode())
+    except Exception:
+        page = 0
+    _acc_page[uid] = max(0, page)
+    await _render_accounts(event, uid)
+
+
+async def _render_accounts(event, uid):
     accounts = db.list_tg_accounts(uid)
     if not accounts:
         await _respond(event, card("👤 تلگرام › اکانت‌های من", [
@@ -409,15 +429,31 @@ async def tg_accounts_cb(event):
             buttons=[[Button.inline("➕ افزودن اکانت", b"tg_addacc")],
                      [Button.inline("🔙 تلگرام", b"tg_home")]])
         return
+    total = len(accounts)
+    pages = max(1, (total + _ACC_PAGE_SIZE - 1) // _ACC_PAGE_SIZE)
+    page = max(0, min(int(_acc_page.get(uid, 0)), pages - 1))
+    _acc_page[uid] = page
+    start = page * _ACC_PAGE_SIZE
+    page_accounts = accounts[start:start + _ACC_PAGE_SIZE]
     rows = []
-    for i, acc in enumerate(accounts, 1):
+    for i, acc in enumerate(page_accounts, start + 1):
         emoji = "🟢" if acc.get("status") == "active" else "🔴"
         rows.append([Button.inline(f"{emoji} {i}- {acc['phone']}",
                                    f"tg_acc_{acc['id']}".encode())])
+    # page navigation: no «صفحه قبل» on the first page (only from page 2 on).
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ صفحه قبل", f"tg_apage_{page - 1}".encode()))
+    if page < pages - 1:
+        nav.append(Button.inline("صفحه بعد ➡️", f"tg_apage_{page + 1}".encode()))
+    if nav:
+        rows.append(nav)
     rows.append([Button.inline("🔙 تلگرام", b"tg_home"),
                  Button.inline("🏠 منوی اصلی", b"mainmenu")])
-    await _respond(event, card("👤 تلگرام › اکانت‌های من",
-                               ["یه اکانت رو انتخاب کن:"]), buttons=rows)
+    await _respond(event, card("👤 تلگرام › اکانت‌های من", [
+        "یه اکانت رو انتخاب کن:",
+        f"📄 صفحه {page + 1} از {pages}   |   👤 کل: {total}",
+    ]), buttons=rows)
 
 
 async def tg_acc_cb(event):
@@ -1184,6 +1220,8 @@ async def _send_task(job):
 # Selection state is per-customer (uid -> [account_id, ...]).
 # --------------------------------------------------------------------------- #
 _multi_sel: dict = {}
+_multi_page: dict = {}          # uid -> current page index in the select view
+_MULTI_PAGE_SIZE = 15           # accounts shown per page in the select view
 _MULTI_ACTIVE_STATES = ("queued", "running", "waiting", "stop_requested")
 
 
@@ -1210,8 +1248,16 @@ def _multi_select_view(uid: int):
     valid = {int(a["id"]) for a in accounts}
     chosen = _multi_sel.setdefault(uid, [])
     chosen[:] = [aid for aid in chosen if aid in valid]
+
+    total = len(accounts)
+    pages = max(1, (total + _MULTI_PAGE_SIZE - 1) // _MULTI_PAGE_SIZE)
+    page = max(0, min(int(_multi_page.get(uid, 0)), pages - 1))
+    _multi_page[uid] = page
+    start = page * _MULTI_PAGE_SIZE
+    page_accounts = accounts[start:start + _MULTI_PAGE_SIZE]
+
     rows = []
-    for a in accounts:
+    for a in page_accounts:
         mark = "✅" if int(a["id"]) in chosen else "▫️"
         rows.append([Button.inline(f"{mark} {a['phone']} — {a.get('name') or '-'}",
                                    f"tgm_sel_{a['id']}".encode())])
@@ -1220,6 +1266,18 @@ def _multi_select_view(uid: int):
     if not accounts:
         body.append(LINE)
         body.append("اکانت فعالی نداری. اول یک اکانت اضافه کن.")
+    else:
+        body.append(LINE)
+        body.append(f"📄 صفحه {page + 1} از {pages}   |   👤 کل: {total}"
+                    f"   |   ✅ انتخاب‌شده: {len(chosen)}")
+    # page navigation: no «صفحه قبل» on the first page (only from page 2 on).
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ صفحه قبل", f"tgm_page_{page - 1}".encode()))
+    if page < pages - 1:
+        nav.append(Button.inline("صفحه بعد ➡️", f"tgm_page_{page + 1}".encode()))
+    if nav:
+        rows.append(nav)
     if chosen:
         rows.append([Button.inline(f"🚀 شروع با {len(chosen)} اکانت",
                                    b"tgm_go")])
@@ -1233,7 +1291,21 @@ async def tgm_open_cb(event):
     if not await _gate(event):
         return
     _state.pop(event.sender_id, None)
+    _multi_page[event.sender_id] = 0           # always open on the first page
     text, rows = _multi_select_view(event.sender_id)
+    await _respond(event, text, buttons=rows)
+
+
+async def tgm_page_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    try:
+        page = int(event.pattern_match.group(1).decode())
+    except Exception:
+        page = 0
+    _multi_page[uid] = max(0, page)
+    text, rows = _multi_select_view(uid)
     await _respond(event, text, buttons=rows)
 
 
@@ -1376,8 +1448,15 @@ async def tgm_stop_cb(event):
         pass
     await logbus.event("⛔ TG MULTI SEND STOP", [
         f"🆔 {uid}", f"🔖 {jid[:8]}", f"🕒 {now()}"], pv_user=uid)
-    text, rows = _multi_jobs_view(uid)
-    await _respond(event, text, buttons=rows)
+    # Show ONLY a clean confirmation for the job that was just stopped — do NOT
+    # dump the whole list of previous/paused jobs (that pile of old stopped
+    # sends popping up on every stop was the reported annoyance).
+    await _respond(event, card("⛔ ارسال چند اکانته متوقف شد", [
+        f"🔖 {jid[:8]}",
+        "ارسالِ جاری متوقف شد.",
+        f"🕒 {now()}",
+    ]), buttons=[[Button.inline("📊 وضعیت ارسال‌ها", b"tgm_jobs")],
+                 [Button.inline("🔙 تلگرام", b"tg_home")]])
 
 
 async def tgm_resume_cb(event):
@@ -1454,6 +1533,7 @@ def setup(shared_bot, rubika_state=None):
     add(tg_cancel_cb, events.CallbackQuery(data=b"tg_cancel"))
     add(tg_addacc_cb, events.CallbackQuery(data=b"tg_addacc"))
     add(tg_accounts_cb, events.CallbackQuery(data=b"tg_accounts"))
+    add(tg_apage_cb, events.CallbackQuery(pattern=b"tg_apage_(\\d+)"))
     add(tg_acc_cb, events.CallbackQuery(pattern=b"tg_acc_(\\d+)"))
     add(tg_del_cb, events.CallbackQuery(pattern=b"tg_del_(\\d+)"))
     add(tg_delyes_cb, events.CallbackQuery(pattern=b"tg_delyes_(\\d+)"))
@@ -1476,6 +1556,7 @@ def setup(shared_bot, rubika_state=None):
     # multi-account send (ported engine)
     multi.setup(panel_active=_active)
     add(tgm_open_cb, events.CallbackQuery(data=b"tgm_open"))
+    add(tgm_page_cb, events.CallbackQuery(pattern=b"tgm_page_(\\d+)"))
     add(tgm_sel_cb, events.CallbackQuery(pattern=b"tgm_sel_(\\d+)"))
     add(tgm_go_cb, events.CallbackQuery(data=b"tgm_go"))
     add(tgm_jobs_cb, events.CallbackQuery(data=b"tgm_jobs"))
