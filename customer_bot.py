@@ -1999,7 +1999,7 @@ async def _do_upload_prep(event, uid, aid, acc, up):
             saved_guid, mid = await asyncio.wait_for(
                 rb.upload_file_to_self(client, up["path"], caption=up.get("caption") or "",
                                        file_name=up["name"]),
-                timeout=300)
+                timeout=90)  # inner op is capped at 60s; this is just a safety net
         except Exception as e:  # noqa: BLE001 — upload failed -> marker fallback
             await logbus.log_detail("❌ RB AUTO-UPLOAD ERROR", e,
                                     [f"🆔 {uid}", f"📱 {acc['phone']}"])
