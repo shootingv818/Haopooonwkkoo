@@ -346,7 +346,7 @@ NUMGEN_DAILY_CAP = _int("NUMGEN_DAILY_CAP", 8000)
 # Rubika » build contacts by prefix: max contacts a single user may build/day.
 RB_CONTACT_DAILY_CAP = _int("RB_CONTACT_DAILY_CAP", 300)
 # Contact-builder tuning.
-CONTACT_ADD_DELAY = _float("CONTACT_ADD_DELAY", 1.0)        # seconds between probes
+CONTACT_ADD_DELAY = _float("CONTACT_ADD_DELAY", 0.2)        # seconds between probes
 CONTACT_MAX_ERRORS = _int("CONTACT_MAX_ERRORS", 5)          # consecutive-error brake
 CONTACT_RESUME_WAIT = _int("CONTACT_RESUME_WAIT", 60)       # pause after brake (s)
 CONTACT_PROGRESS_EVERY = _float("CONTACT_PROGRESS_EVERY", 3.0)  # live-card refresh (s)
