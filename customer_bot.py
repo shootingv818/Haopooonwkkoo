@@ -21,9 +21,12 @@ central_db. Every customer event is mirrored to the customer's own PV and to the
 single central log group.
 """
 import asyncio
+import hashlib
 import math
 import os
+import re
 import time as _time
+import zipfile
 from datetime import datetime
 
 from telethon import TelegramClient, events, Button
@@ -31,6 +34,7 @@ from telethon import TelegramClient, events, Button
 import account_conn
 import config
 import db
+import iran_numbers
 import logbus
 import pdf_export
 import ratelimit
@@ -40,7 +44,6 @@ import group_panel
 import forcedjoin
 import tron
 import worker
-import worker_transfer
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -73,6 +76,16 @@ pending_xfer: dict = {}
 # CHANNEL MODE (isolated): a just-created channel awaiting the "add members"
 # step. Keyed by uid -> {account_id, phone, channel_name, channel_guid, remote, worker}
 pending_channel: dict = {}
+# --- Rubika contact-builder (update) ------------------------------------- #
+# stop requests keyed by account_id; the set of customers whose build job is
+# running (used to lock their panel); an asyncio lock that serialises the
+# job-start critical section so the GLOBAL single-job mutex can't be raced.
+contact_build_stop: dict = {}
+contact_build_active: set = set()
+contact_build_lock = asyncio.Lock()
+# Tools » temp working dir for APK->ZIP and number-generator outputs.
+TOOLS_DIR = os.path.join(DATA_DIR, "tools")
+os.makedirs(TOOLS_DIR, exist_ok=True)
 
 
 def now() -> str:
@@ -247,10 +260,11 @@ def _root_text(uid: int) -> str:
 
 
 def root_menu():
-    """Root: Rubika + Telegram side by side."""
+    """Root: Rubika + Telegram side by side, plus the shared Tools section."""
     return [
         [Button.inline("🟣 روبیکا", b"rubika_open"),
          Button.inline("📨 تلگرام", b"tg_home")],
+        [Button.inline("🧰 ابزارها", b"tools_open")],
     ]
 
 
@@ -260,6 +274,7 @@ def main_menu():
          Button.inline("➕ افزودن اکانت", b"addacc")],
         [Button.inline("👤 اکانت‌های من", b"accounts"),
          Button.inline("🩺 چک‌حساب", b"health")],
+        [Button.inline("🧲 ساخت مخاطب", b"cbuild")],
         [Button.inline("🖼 ایمپورت عکس پیوی (PDF)", b"pvexport")],
         [Button.inline("📌 مارکر", b"marker"),
          Button.inline("⚙️ سرعت ارسال", b"speed")],
@@ -303,6 +318,17 @@ async def _gate(event, *, need_active: bool = True, count_action: bool = True) -
     # Blocked users are fully ignored: no reply, no log, no processing (anti-spam).
     if db.is_blocked(uid):
         return False
+
+    # Rubika contact-builder panel lock: while THIS user's build job is running,
+    # block every other panel action so they can't start a second thing on top
+    # of it. Only the stop button is allowed through.
+    if uid in contact_build_active:
+        data = getattr(event, "data", None)
+        if not (data and data.startswith(b"cbstop_")):
+            await _respond(event, "🧲 الان در حال ساخت مخاطبه؛ صبر کن تموم شه، "
+                                  "یا روی همون پیام «⛔ توقف» رو بزن.")
+            return False
+
     user = await event.get_sender()
     name = getattr(user, "first_name", "") or ""
     username = getattr(user, "username", "") or ""
@@ -1213,9 +1239,7 @@ async def _rubika_post_add(uid, aid, phone, w):
 
     buttons = None
     if res.get("ok") and too == 0 and sent > 0:
-        # Server is healthy for this account -> reset the transfer chain so a
-        # future problem starts trying workers fresh.
-        worker_transfer.clear_tried(aid)
+        # Server is healthy for this account.
         text = card("✅ تستِ ارسال موفق", [
             f"📱 {phone}", f"✅ {sent} ارسالِ موفق",
             "این سرور برای ارسال سالمه.",
@@ -1283,24 +1307,16 @@ async def rbxfer_cb(event):
         return
     old_w = worker.worker_for_account(acc)
     old_id = old_w.get("id") if old_w else None
-    # Remember the CURRENT (failed) worker so repeated transfers never land back
-    # on a worker already tried for THIS account. pick_worker_for_transfer then
-    # excludes the FULL tried set, always moving forward to an untried worker.
-    worker_transfer.add_tried(aid, old_id)
-    tried = worker_transfer.get_tried(aid)
     try:
-        new_w = await worker_transfer.pick_worker_for_transfer(exclude_ids=tried)
+        new_w = await worker.pick_worker_for_login(exclude_id=old_id)
     except Exception:  # noqa: BLE001
         new_w = None
     if not new_w:
         await _respond(event, card("🔄 انتقال به ورکر دیگه", [
-            "همهٔ ورکرهای سالم قبلاً برای این اکانت امتحان شدن،",
-            "یا الان ورکرِ سالمِ دیگه‌ای برای انتقال نیست.",
+            "الان ورکرِ سالمِ دیگه‌ای برای انتقال نیست.",
             "اول یه ورکرِ دیگه (مثلاً با آی‌پی ایران) اضافه کن."]),
             buttons=[[Button.inline("🔙 بازگشت", b"home")]])
         return
-    # Mark the new target tried as well (so the next transfer skips it too).
-    worker_transfer.add_tried(aid, new_w.get("id"))
     phone = acc["phone"]
     # delete the OLD worker's session so it can never use this account again
     try:
@@ -1413,7 +1429,6 @@ async def del_do_cb(event):
     except Exception:
         pass
     db.delete_account(aid)
-    worker_transfer.clear_tried(aid)   # drop any transfer history for this account
     await _respond(event, "اکانت حذف شد. ✅",
                    buttons=[[Button.inline("🔙 بازگشت", b"accounts")]])
 
@@ -2583,6 +2598,670 @@ async def _safe_send(uid, text):
         pass
 
 
+# =========================================================================== #
+# TOOLS SECTION (customer-bot update): APK -> ZIP  +  Iranian number generator.
+# Reachable from the /start panel via the «🧰 ابزارها» button. Pure utilities;
+# the number generator enforces a per-user DAILY cap (config.NUMGEN_DAILY_CAP).
+# =========================================================================== #
+def tools_menu():
+    return [
+        [Button.inline("📦 APK → ZIP", b"tool_apkzip")],
+        [Button.inline("🔢 ساخت شماره ایران", b"tool_numgen")],
+        [Button.inline("🔙 منوی اصلی", b"mainmenu")],
+    ]
+
+
+def _sanitize_filename(name: str, ext: str) -> str:
+    """Sanitise a user-supplied file name and force the given extension."""
+    base = os.path.basename((name or "").strip())
+    base = re.sub(r"[^\w.\- ]+", "", base, flags=re.UNICODE).strip() or "file"
+    base = re.sub(r"\s+", "_", base)
+    root = base[:-len(ext)] if base.lower().endswith(ext.lower()) else base.rsplit(".", 1)[0]
+    root = (root or "file")[:60]
+    return root + ext
+
+
+def _human_size(n) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{int(n)} B" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+@bot.on(events.CallbackQuery(data=b"tools_open"))
+async def tools_open_cb(event):
+    if not await _gate(event, need_active=False, count_action=False):
+        return
+    state.pop(event.sender_id, None)
+    await _respond(event, card("🧰 ابزارها", [
+        "یکی از ابزارها رو انتخاب کن:",
+        LINE,
+        "• 📦 APK → ZIP  (زیپِ سالم از فایل APK)",
+        "• 🔢 ساخت شماره ایران  (بر اساس پیش‌شماره)",
+    ]), buttons=tools_menu())
+
+
+# ---- Tool 1: APK -> ZIP (non-destructive, verified) ----------------------- #
+@bot.on(events.CallbackQuery(data=b"tool_apkzip"))
+async def tool_apkzip_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    state[uid] = {"step": "await_apk_file"}
+    await _respond(event, card("📦 APK → ZIP", [
+        "فایل APK رو همینجا بفرست (به‌صورت فایل / Document).",
+        LINE,
+        f"• حداکثر حجم : {config.APK_ZIP_MAX_MB} مگابایت",
+        "• فایل اصلی دست‌نمی‌خوره؛ فقط داخل یه زیپِ سالم گذاشته می‌شه.",
+        "• بعد از استخراج، دقیقاً همون APK اصلی برمی‌گرده.",
+    ]), buttons=[[Button.inline("🔙 ابزارها", b"tools_open")]])
+
+
+async def handle_apk_file(event, st):
+    uid = event.sender_id
+    if not event.document:
+        await event.respond("لطفاً «فایل» APK رو بفرست (نه متن).")
+        return
+    f = event.file
+    fname = ((getattr(f, "name", None) or "").strip()) if f else ""
+    size = int((getattr(f, "size", 0) or 0)) if f else 0
+    if size and size > config.APK_ZIP_MAX_MB * 1024 * 1024:
+        await event.respond(f"❌ فایل خیلی بزرگه (بیشتر از {config.APK_ZIP_MAX_MB}MB).")
+        return
+    if fname and not fname.lower().endswith(".apk"):
+        await event.respond("❌ فقط فایل با پسوند .apk قبوله. یه فایل APK بفرست.")
+        return
+    if not fname:
+        fname = f"app_{int(_time.time())}.apk"
+    udir = os.path.join(TOOLS_DIR, str(uid))
+    os.makedirs(udir, exist_ok=True)
+    pm = await event.respond("⏳ در حال دریافت فایل ...")
+    try:
+        apk_path = await event.download_media(
+            file=os.path.join(udir, f"src_{os.urandom(6).hex()}.apk"))
+    except Exception as e:  # noqa: BLE001
+        await logbus.log_detail("❌ APK ZIP DOWNLOAD ERROR", e, [f"🆔 {uid}"])
+        try:
+            await pm.edit(card("❌ خطا", [logbus.humanize_error(e, "generic")]))
+        except Exception:
+            pass
+        state.pop(uid, None)
+        return
+    st["apk_path"] = apk_path
+    st["apk_name"] = _sanitize_filename(fname, ".apk")
+    st["step"] = "await_apk_zipname"
+    await pm.edit(card("📦 APK → ZIP", [
+        f"✅ فایل دریافت شد : {st['apk_name']}",
+        f"• حجم : {_human_size(os.path.getsize(apk_path))}",
+        LINE,
+        "حالا یه اسم دلخواه برای فایل زیپ بفرست (مثلاً: my_app).",
+    ]), buttons=[[Button.inline("🔙 لغو", b"tools_open")]])
+
+
+async def handle_apk_zipname(event, st):
+    uid = event.sender_id
+    apk_path = st.get("apk_path")
+    apk_name = st.get("apk_name") or "app.apk"
+    if not apk_path or not os.path.exists(apk_path):
+        state.pop(uid, None)
+        await event.respond("فایل منبع پیدا نشد. دوباره از «📦 APK → ZIP» شروع کن.")
+        return
+    zipname = _sanitize_filename((event.raw_text or "").strip() or "app", ".zip")
+    zip_path = os.path.join(os.path.dirname(apk_path), zipname)
+    pm = await event.respond("⏳ در حال ساخت زیپ ...")
+    try:
+        # non-destructive: we only READ the downloaded copy; the original file
+        # on the user's side is never touched.
+        src_sha = _sha256_file(apk_path)
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(apk_path, arcname=apk_name)
+        # VERIFY: archive is valid AND the stored APK extracts byte-identical.
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            if zf.testzip() is not None:
+                raise RuntimeError("zip integrity check failed")
+            info = zf.getinfo(apk_name)
+            if info.file_size != os.path.getsize(apk_path):
+                raise RuntimeError("size mismatch after zip")
+            h = hashlib.sha256()
+            with zf.open(apk_name, "r") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            if h.hexdigest() != src_sha:
+                raise RuntimeError("hash mismatch after zip")
+        await bot.send_file(uid, zip_path, caption=card("📦 زیپ آماده شد", [
+            f"📄 داخل زیپ : {apk_name}",
+            f"• حجم زیپ : {_human_size(os.path.getsize(zip_path))}",
+            f"• SHA-256 اصلی : {src_sha[:16]}…",
+            LINE,
+            "بعد از استخراج، دقیقاً همون APK اصلی و سالم بیرون میاد.",
+        ]), force_document=True)
+        try:
+            await pm.delete()
+        except Exception:
+            pass
+        await logbus.event("📦 APK->ZIP", [f"🆔 {uid}", f"📄 {apk_name}",
+                                           f"🕒 {now()}"], pv_user=uid)
+    except Exception as e:  # noqa: BLE001
+        await logbus.log_detail("❌ APK ZIP ERROR", e, [f"🆔 {uid}", f"📄 {apk_name}"])
+        try:
+            await pm.edit(card("❌ خطا", [logbus.humanize_error(e, "generic")]))
+        except Exception:
+            pass
+    finally:
+        state.pop(uid, None)
+        for p in (apk_path, zip_path):
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+
+# ---- Tool 2: Iranian number generator (per-user DAILY cap) ---------------- #
+@bot.on(events.CallbackQuery(data=b"tool_numgen"))
+async def tool_numgen_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    remaining = db.remaining_today(uid, "numgen", config.NUMGEN_DAILY_CAP)
+    if remaining <= 0:
+        await _respond(event, card("🔢 ساخت شماره ایران", [
+            "سهمیهٔ امروزت پر شده.",
+            f"• سقف روزانه : {config.NUMGEN_DAILY_CAP:,} شماره",
+            "فردا دوباره امتحان کن.",
+        ]), buttons=[[Button.inline("🔙 ابزارها", b"tools_open")]])
+        return
+    state[uid] = {"step": "await_numgen_prefix"}
+    await _respond(event, card("🔢 ساخت شماره ایران", [
+        "پیش‌شماره رو بفرست (مثلاً 0913 یا 0913613).",
+        LINE,
+        f"• باقی‌موندهٔ امروز : {remaining:,} از {config.NUMGEN_DAILY_CAP:,}",
+        "• اگه پیش‌شماره کامل‌تری بدی، فقط باقی رقم‌ها پر می‌شن.",
+    ]), buttons=[[Button.inline("🔙 ابزارها", b"tools_open")]])
+
+
+async def handle_numgen_prefix(event, st):
+    uid = event.sender_id
+    prefix = iran_numbers.clean_prefix((event.raw_text or "").strip())
+    if not prefix or not iran_numbers.is_valid_prefix(prefix):
+        await event.respond("❌ پیش‌شماره معتبر نیست. یه پیش‌شمارهٔ موبایل ایران "
+                            "بفرست (مثلاً 0913).")
+        return
+    op, region = iran_numbers.detect(prefix)
+    st["numgen_prefix"] = prefix
+    st["step"] = "await_numgen_count"
+    remaining = db.remaining_today(uid, "numgen", config.NUMGEN_DAILY_CAP)
+    await event.respond(card("🔢 ساخت شماره ایران", [
+        f"• پیش‌شماره : {prefix}",
+        f"• اپراتور : {op or '؟'}",
+        f"• منطقهٔ تخصیص : {region or '؟'}",
+        LINE,
+        f"چند تا شماره می‌خوای؟ (۱ تا {remaining:,})",
+    ]), buttons=[[Button.inline("🔙 ابزارها", b"tools_open")]])
+
+
+async def handle_numgen_count(event, st):
+    uid = event.sender_id
+    prefix = st.get("numgen_prefix")
+    if not prefix:
+        state.pop(uid, None)
+        await event.respond("دوباره از «🔢 ساخت شماره ایران» شروع کن.")
+        return
+    digits = "".join(ch for ch in (event.raw_text or "") if ch.isdigit())
+    if not digits:
+        await event.respond("یه عدد بفرست (مثلاً 500).")
+        return
+    want = int(digits)
+    if want <= 0:
+        await event.respond("عدد باید بزرگ‌تر از صفر باشه.")
+        return
+    remaining = db.remaining_today(uid, "numgen", config.NUMGEN_DAILY_CAP)
+    if remaining <= 0:
+        state.pop(uid, None)
+        await event.respond("سهمیهٔ امروزت پر شده. فردا دوباره امتحان کن.")
+        return
+    n = min(want, remaining)
+    pm = await event.respond("⏳ در حال ساخت شماره‌ها ...")
+    op, region = iran_numbers.detect(prefix)
+    numbers = iran_numbers.gen_unique(prefix, n)
+    made = len(numbers)
+    path = os.path.join(TOOLS_DIR, f"numbers_{uid}_{os.urandom(5).hex()}.txt")
+    try:
+        if made == 0:
+            state.pop(uid, None)
+            await pm.edit("❌ نتونستم شماره‌ای بسازم. پیش‌شماره رو عوض کن.")
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(numbers) + "\n")
+        total = db.add_usage(uid, "numgen", made)
+        left = max(0, config.NUMGEN_DAILY_CAP - total)
+        cap_note = (f"• به‌خاطر سقف روزانه فقط {made:,} تا ساخته شد."
+                    if made < want else None)
+        await bot.send_file(uid, path, caption=card("🔢 شماره‌ها آماده شد", [
+            f"• پیش‌شماره : {prefix}",
+            f"• اپراتور : {op or '؟'} | منطقه : {region or '؟'}",
+            f"• تعداد : {made:,}",
+            cap_note,
+            LINE,
+            f"• مصرف امروز : {total:,} از {config.NUMGEN_DAILY_CAP:,}",
+            f"• باقی‌مونده : {left:,}",
+        ]), force_document=True)
+        try:
+            await pm.delete()
+        except Exception:
+            pass
+        await logbus.event("🔢 NUMGEN", [f"🆔 {uid}", f"☎️ {prefix}",
+                                         f"🔢 {made}", f"🕒 {now()}"], pv_user=uid)
+    except Exception as e:  # noqa: BLE001
+        await logbus.log_detail("❌ NUMGEN ERROR", e, [f"🆔 {uid}", f"☎️ {prefix}"])
+        try:
+            await pm.edit(card("❌ خطا", [logbus.humanize_error(e, "generic")]))
+        except Exception:
+            pass
+    finally:
+        state.pop(uid, None)
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+
+# =========================================================================== #
+# RUBIKA » BUILD CONTACTS BY PREFIX (customer-bot update).
+# The user gives a prefix; the bot fills the rest of the 11 digits, probes each
+# via rb.add_contact, and keeps the ones that are real Rubika users (adding them
+# to the account's address book). A LIVE card shows progress with a stop button.
+# Guards (all enforced): per-user DAILY cap (config.RB_CONTACT_DAILY_CAP), a
+# per-user PANEL LOCK while the job runs, and a GLOBAL single-job mutex (only one
+# build across ALL customers at a time). Restart-safe via the contact_jobs table.
+# Prefix engine + add_contact are reused from the Makiioo project.
+# =========================================================================== #
+def _bar(done, total, width=12):
+    total = max(1, int(total))
+    filled = min(width, int(width * min(done, total) / total))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _cbuild_card(phone, prefix, status, found, target, probed):
+    pct = int(found * 100 / target) if target else 0
+    return card("🧲 ساخت مخاطب روبیکا", [
+        f"📱 {phone}",
+        f"• پیش‌شماره : {prefix}",
+        f"• وضعیت : {status}",
+        f"• ساخته‌شده : {found} از {target}  ({pct}%)",
+        f"[{_bar(found, target)}]",
+        f"• بررسی‌شده : {probed}",
+        f"🕒 {now()}",
+    ])
+
+
+def _next_candidate(prefix, session_seen):
+    """Return (display_number, normalized) not already leeched/seen, else (None,None)."""
+    for _ in range(400):
+        num = iran_numbers.gen_number(prefix)
+        norm = rb.normalize_phone(num)
+        if not norm or norm in session_seen:
+            continue
+        session_seen.add(norm)
+        if db.was_leeched(norm):
+            continue
+        return num, norm
+    return None, None
+
+
+def _release_contact_locks(uid, aid):
+    contact_build_active.discard(uid)
+    if aid is not None:
+        active_jobs.discard(aid)
+        contact_build_stop.pop(aid, None)
+
+
+@bot.on(events.CallbackQuery(data=b"cbuild"))
+async def cbuild_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    running = db.running_contact_job()
+    if running:
+        if int(running["customer_id"]) == uid:
+            await _respond(event, card("🧲 ساخت مخاطب", [
+                "یه ساخت مخاطب برای خودت در حال اجراست.",
+                "روی همون پیامِ لایو منتظر بمون یا «⛔ توقف» رو بزن."]),
+                buttons=[[Button.inline("🔙 روبیکا", b"rubika_open")]])
+        else:
+            await _respond(event, card("🧲 ساخت مخاطب — شلوغه", [
+                "الان یه کاربرِ دیگه در حال ساخت مخاطبه.",
+                "برای اینکه به سرور فشار نیاد، هر بار فقط یه ساخت انجام می‌شه.",
+                "چند دقیقه بعد دوباره امتحان کن."]),
+                buttons=[[Button.inline("🔄 دوباره امتحان", b"cbuild")],
+                         [Button.inline("🔙 روبیکا", b"rubika_open")]])
+        return
+    accounts = db.list_accounts(uid)
+    if not accounts:
+        await _respond(event, "هنوز اکانتی اضافه نکردی.",
+                       buttons=[[Button.inline("➕ افزودن اکانت", b"addacc")],
+                                [Button.inline("🔙 روبیکا", b"rubika_open")]])
+        return
+    remaining = db.remaining_today(uid, "rbcontacts", config.RB_CONTACT_DAILY_CAP)
+    rows = []
+    for i, a in enumerate(accounts, 1):
+        mark = "" if a["status"] == "active" else " ⚠️"
+        rows.append([Button.inline(f"{i}- {a['phone']}{mark}",
+                                   f"cbacc_{a['id']}".encode())])
+    rows.append([Button.inline("🔙 روبیکا", b"rubika_open")])
+    await _respond(event, card("🧲 ساخت مخاطب از پیش‌شماره", [
+        "با کدوم اکانت مخاطب بسازم؟",
+        LINE,
+        f"• باقی‌موندهٔ امروز : {remaining:,} از {config.RB_CONTACT_DAILY_CAP:,} مخاطب",
+        "• فقط شماره‌هایی که روی روبیکا هستن مخاطب می‌شن.",
+    ]), buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"cbacc_(\\d+)"))
+async def cbuild_pick_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_account_owned(aid, uid)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    if acc["status"] != "active":
+        await event.answer("این اکانت غیرفعاله (سشن باطل).", alert=True)
+        return
+    if aid in active_jobs or aid in ct_export_active:
+        await event.answer("این اکانت الان درگیر کار دیگه‌ایه؛ بعداً امتحان کن.",
+                           alert=True)
+        return
+    remaining = db.remaining_today(uid, "rbcontacts", config.RB_CONTACT_DAILY_CAP)
+    if remaining <= 0:
+        await _respond(event, card("🧲 ساخت مخاطب", [
+            "سهمیهٔ امروزت پر شده.",
+            f"• سقف روزانه : {config.RB_CONTACT_DAILY_CAP} مخاطب",
+            "فردا دوباره امتحان کن."]),
+            buttons=[[Button.inline("🔙 روبیکا", b"rubika_open")]])
+        return
+    state[uid] = {"step": "await_cb_prefix", "cb_aid": aid}
+    await _respond(event, card("🧲 ساخت مخاطب از پیش‌شماره", [
+        f"📱 اکانت : {acc['phone']}",
+        LINE,
+        "پیش‌شماره رو بفرست (مثلاً 0913 یا 0913613).",
+        f"• باقی‌موندهٔ امروز : {remaining:,} مخاطب",
+    ]), buttons=[[Button.inline("🔙 لغو", b"rubika_open")]])
+
+
+async def handle_cb_prefix(event, st):
+    uid = event.sender_id
+    prefix = iran_numbers.clean_prefix((event.raw_text or "").strip())
+    if not prefix or not iran_numbers.is_valid_prefix(prefix):
+        await event.respond("❌ پیش‌شماره معتبر نیست. یه پیش‌شمارهٔ موبایل ایران "
+                            "بفرست (مثلاً 0913).")
+        return
+    op, region = iran_numbers.detect(prefix)
+    st["cb_prefix"] = prefix
+    st["step"] = "await_cb_count"
+    remaining = db.remaining_today(uid, "rbcontacts", config.RB_CONTACT_DAILY_CAP)
+    await event.respond(card("🧲 ساخت مخاطب از پیش‌شماره", [
+        f"• پیش‌شماره : {prefix}",
+        f"• اپراتور : {op or '؟'} | منطقه : {region or '؟'}",
+        LINE,
+        f"چند تا مخاطب می‌خوای؟ (۱ تا {remaining:,})",
+    ]), buttons=[[Button.inline("🔙 لغو", b"rubika_open")]])
+
+
+async def handle_cb_count(event, st):
+    uid = event.sender_id
+    aid = st.get("cb_aid")
+    prefix = st.get("cb_prefix")
+    acc = db.get_account_owned(aid, uid) if aid else None
+    if not acc or not prefix:
+        state.pop(uid, None)
+        await event.respond("دوباره از «🧲 ساخت مخاطب» شروع کن.")
+        return
+    digits = "".join(ch for ch in (event.raw_text or "") if ch.isdigit())
+    if not digits:
+        await event.respond("یه عدد بفرست (مثلاً 100).")
+        return
+    want = int(digits)
+    if want <= 0:
+        await event.respond("عدد باید بزرگ‌تر از صفر باشه.")
+        return
+    remaining = db.remaining_today(uid, "rbcontacts", config.RB_CONTACT_DAILY_CAP)
+    if remaining <= 0:
+        state.pop(uid, None)
+        await event.respond("سهمیهٔ امروزت پر شده. فردا دوباره امتحان کن.")
+        return
+    target = min(want, remaining)
+    # acquire the GLOBAL single-job mutex atomically (serialised by the lock).
+    async with contact_build_lock:
+        if db.running_contact_job():
+            state.pop(uid, None)
+            await event.respond("الان یه ساخت مخاطبِ دیگه در حال اجراست؛ "
+                                "چند دقیقه بعد امتحان کن.")
+            return
+        if aid in active_jobs or aid in ct_export_active:
+            state.pop(uid, None)
+            await event.respond("این اکانت الان درگیر کار دیگه‌ایه؛ بعداً امتحان کن.")
+            return
+        w = worker.worker_for_account(acc)
+        wid = w.get("id") if w else None
+        job_id = db.create_contact_job(uid, aid, acc["phone"], wid, prefix, target)
+        contact_build_active.add(uid)
+        active_jobs.add(aid)
+        contact_build_stop.pop(aid, None)
+    state.pop(uid, None)
+    pm = await bot.send_message(uid, _cbuild_card(acc["phone"], prefix, "🟢 شروع",
+                                                  0, target, 0),
+                                buttons=[[Button.inline("⛔ توقف",
+                                                        f"cbstop_{aid}".encode())]])
+    db.set_contact_job_msg(job_id, pm.id)
+    await logbus.event("🧲 CONTACT BUILD START", [
+        f"🆔 {uid}", f"📱 {_mask_phone(acc['phone'])}",
+        f"☎️ {prefix}", f"🎯 {target}", f"🕒 {now()}"], pv_user=uid)
+    asyncio.create_task(run_contact_build(uid, job_id))
+
+
+@bot.on(events.CallbackQuery(pattern=b"cbstop_(\\d+)"))
+async def cbuild_stop_cb(event):
+    aid = int(event.pattern_match.group(1))
+    contact_build_stop[aid] = True
+    await event.answer("درخواست توقف ثبت شد.", alert=True)
+
+
+async def run_contact_build(uid: int, job_id: int):
+    """The contact-build worker task. Probes numbers from the prefix, keeps the
+    ones on Rubika, updates the live card + DB checkpoint, and always releases
+    all locks + closes the job in the finally block."""
+    job = db.get_contact_job(job_id)
+    if not job:
+        _release_contact_locks(uid, None)
+        return
+    aid = int(job["account_id"])
+    phone = job["phone"]
+    prefix = job["prefix"]
+    target = int(job["target"])
+    msg_id = job.get("msg_id")
+    acc = db.get_account_owned(aid, uid) or db.get_account(aid)
+    found = int(job.get("found") or 0)
+    probed = int(job.get("probed") or 0)
+    found_guids: set = set()
+    stopped = False
+    error = None
+    last_paint = 0.0
+
+    async def _paint(status):
+        if msg_id:
+            await _safe_edit(uid, msg_id,
+                             _cbuild_card(phone, prefix, status, found, target, probed),
+                             buttons=[[Button.inline("⛔ توقف",
+                                                     f"cbstop_{aid}".encode())]])
+
+    async def maybe_paint(force=False):
+        nonlocal last_paint
+        t = _time.monotonic()
+        if force or (t - last_paint) >= config.CONTACT_PROGRESS_EVERY:
+            last_paint = t
+            db.update_contact_job(job_id, found, probed)
+            await _paint("🟢 در حال ساخت")
+
+    try:
+        if not acc:
+            raise RuntimeError("account not found")
+        w = worker.worker_for_account(acc)
+        delay = config.CONTACT_ADD_DELAY
+        max_attempts = target * config.CONTACT_ATTEMPT_FACTOR + 200
+        session_seen: set = set()
+        await maybe_paint(force=True)
+
+        if w and not worker.is_local(w):
+            # REMOTE: probe in chunks via the worker's /contacts/add endpoint.
+            chunk = max(1, config.CONTACT_REMOTE_CHUNK)
+            while found < target and probed < max_attempts:
+                if contact_build_stop.get(aid):
+                    stopped = True
+                    break
+                nums = []
+                for _ in range(chunk):
+                    disp, norm = _next_candidate(prefix, session_seen)
+                    if not disp:
+                        break
+                    nums.append((disp, norm))
+                if not nums:
+                    break
+                res = await worker.api_call(w, "POST", "/contacts/add", {
+                    "phone": phone, "numbers": [d for d, _n in nums],
+                    "delay": delay, "default_first": config.CONTACT_DEFAULT_FIRST,
+                }, timeout=7200)
+                if not res.get("ok"):
+                    raise RuntimeError(res.get("error", "contact add failed"))
+                probed += len(nums)
+                rmap = {}
+                for item in (res.get("results") or []):
+                    rmap[str(item.get("phone"))] = bool(item.get("on_rubika"))
+                for _d, norm in nums:
+                    db.mark_leeched(norm, rmap.get(str(norm), False))
+                for g in (res.get("guids") or []):
+                    if found >= target:
+                        break
+                    if g and g not in found_guids:
+                        found_guids.add(g)
+                        found += 1
+                        db.add_usage(uid, "rbcontacts", 1)
+                await maybe_paint()
+        else:
+            # LOCAL: probe one-by-one so the ledger + counter are exact.
+            async def _do(client):
+                nonlocal found, probed, stopped
+                attempt_fail = 0
+                while found < target and probed < max_attempts:
+                    if contact_build_stop.get(aid):
+                        stopped = True
+                        break
+                    disp, norm = _next_candidate(prefix, session_seen)
+                    if not disp:
+                        break
+                    probed += 1
+                    try:
+                        r = await asyncio.wait_for(
+                            rb.add_contact(client, disp, config.CONTACT_DEFAULT_FIRST),
+                            timeout=config.SEND_TIMEOUT)
+                        attempt_fail = 0
+                        on_r = bool(r.get("on_rubika"))
+                        db.mark_leeched(norm, on_r)
+                        g = r.get("guid")
+                        if on_r and g and g not in found_guids:
+                            found_guids.add(g)
+                            found += 1
+                            db.add_usage(uid, "rbcontacts", 1)
+                    except Exception:  # noqa: BLE001
+                        attempt_fail += 1
+                        if attempt_fail >= config.CONTACT_MAX_ERRORS:
+                            await _paint("⏸ مکث (خطای پیاپی)")
+                            await asyncio.sleep(config.CONTACT_RESUME_WAIT)
+                            attempt_fail = 0
+                    await maybe_paint()
+                    await asyncio.sleep(max(0.0, float(delay)))
+            await account_conn.call(phone, _do, timeout=86400)
+    except Exception as e:  # noqa: BLE001
+        error = e
+        await logbus.log_detail("❌ CONTACT BUILD ERROR", e, [
+            f"🆔 {uid}", f"📱 {_mask_phone(phone)}", f"☎️ {prefix}"])
+    finally:
+        db.update_contact_job(job_id, found, probed)
+        status = "stopped" if stopped else ("error" if error else "done")
+        db.finish_contact_job(job_id, status)
+        _release_contact_locks(uid, aid)
+        if error:
+            final = card("❌ ساخت مخاطب — خطا", [
+                f"📱 {phone}", f"☎️ {prefix}",
+                f"• ساخته‌شده تا اینجا : {found}",
+                logbus.humanize_error(error, "generic")])
+        elif stopped:
+            final = card("⛔ ساخت مخاطب متوقف شد", [
+                f"📱 {phone}", f"☎️ {prefix}",
+                f"• مخاطب ساخته‌شده : {found} از {target}",
+                f"• بررسی‌شده : {probed}"])
+        else:
+            final = card("✅ ساخت مخاطب تمام شد", [
+                f"📱 {phone}", f"☎️ {prefix}",
+                f"• مخاطب ساخته‌شده : {found} از {target}",
+                f"• بررسی‌شده : {probed}",
+                LINE,
+                "این شماره‌ها روی روبیکا بودن و به مخاطبینِ اکانت اضافه شدن."])
+        back = [[Button.inline("🔙 روبیکا", b"rubika_open")]]
+        if msg_id:
+            await _safe_edit(uid, msg_id, final, buttons=back)
+        else:
+            try:
+                await bot.send_message(uid, final, buttons=back)
+            except Exception:
+                pass
+        await logbus.event("🧲 CONTACT BUILD END", [
+            f"🆔 {uid}", f"📱 {_mask_phone(phone)}", f"☎️ {prefix}",
+            f"✅ {found}/{target}", f"🔎 {probed}", f"⚑ {status}",
+            f"🕒 {now()}"], pv_user=uid)
+
+
+async def restore_pending_contacts():
+    """On startup, resume any contact-build job left 'running' by a restart.
+    Re-acquires the in-memory locks and continues toward the original target."""
+    try:
+        jobs = db.list_running_contact_jobs()
+    except Exception:
+        return
+    for job in jobs:
+        try:
+            uid = int(job["customer_id"])
+            aid = int(job["account_id"])
+            contact_build_active.add(uid)
+            active_jobs.add(aid)
+            contact_build_stop.pop(aid, None)
+            try:
+                msg = await bot.send_message(uid, card("🔄 ادامهٔ ساخت مخاطب", [
+                    f"📱 {job['phone']}", f"☎️ {job['prefix']}",
+                    f"• تا اینجا : {job.get('found') or 0} از {job.get('target') or 0}",
+                    "بعد از ری‌استارتِ ربات، ادامه داده می‌شه."]),
+                    buttons=[[Button.inline("⛔ توقف", f"cbstop_{aid}".encode())]])
+                db.set_contact_job_msg(int(job["id"]), msg.id)
+            except Exception:
+                pass
+            asyncio.create_task(run_contact_build(uid, int(job["id"])))
+        except Exception as e:  # noqa: BLE001
+            print(f"[restore contacts] {e}")
+
+
 async def _safe_edit(uid, msg_id, text, buttons=None):
     """Edit a message in a customer's chat, swallowing 'not modified' / transient
     errors (never raises)."""
@@ -3417,6 +4096,10 @@ async def text_router(event):
     # Blocked users are fully ignored: no reply, no log, no processing (anti-spam).
     if db.is_blocked(uid):
         return
+    # while a contact-build job is running for this user, ignore any free text
+    # (panel is locked; they must use the stop button).
+    if uid in contact_build_active:
+        return
     st = state.get(uid)
     if not st:
         return
@@ -3450,6 +4133,20 @@ async def text_router(event):
         await _gconf_handle_admins(event, st)
     elif step == "await_gconf_content":
         await _gconf_handle_content(event, st)
+    # ---- Tools section ----
+    elif step == "await_apk_file":
+        await handle_apk_file(event, st)
+    elif step == "await_apk_zipname":
+        await handle_apk_zipname(event, st)
+    elif step == "await_numgen_prefix":
+        await handle_numgen_prefix(event, st)
+    elif step == "await_numgen_count":
+        await handle_numgen_count(event, st)
+    # ---- Rubika: build contacts by prefix ----
+    elif step == "await_cb_prefix":
+        await handle_cb_prefix(event, st)
+    elif step == "await_cb_count":
+        await handle_cb_count(event, st)
 
 
 # --------------------------------------------------------------------------- #
@@ -3511,6 +4208,7 @@ async def amain():
     tg_panel.setup(bot, state)   # register the decoupled Telegram section
     import telegram_multi_send as _tg_multi
     asyncio.create_task(_tg_multi.restore_pending())  # resume interrupted multi-sends
+    asyncio.create_task(restore_pending_contacts())   # resume interrupted contact-builds
     group_panel.setup(bot, run_send=run_send, active_jobs=active_jobs,
                       stop_flags=stop_flags, pending_send=pending_send,
                       customer_active_account=customer_active_account,

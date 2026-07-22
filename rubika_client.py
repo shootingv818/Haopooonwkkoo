@@ -1505,3 +1505,73 @@ async def upload_file_to_self(client: Client, file_path: str, caption: str = "",
         # method returned but no new message showed up -> treat as failure
         last_err = "send returned but no new message appeared in Saved"
     raise RuntimeError(f"upload_file_to_self failed: {last_err}")
+
+
+
+# =========================================================================== #
+# ADDITIVE — add a phone number to the account's contacts (address book) and
+# report whether that number is actually a Rubika user. Ported from the Makiioo
+# project; version-tolerant across rubpy builds. Never changes any function
+# above. Used by the Rubika "build contacts by prefix" feature.
+# =========================================================================== #
+async def add_contact(client: Client, phone: str, first_name: str = "",
+                      last_name: str = ""):
+    """Add one phone number to the account's Rubika contacts AND report whether
+    that number is actually a Rubika user.
+
+    Returns a dict: {"on_rubika": bool, "guid": str|None}.
+      • on_rubika=True  -> the number belongs to a Rubika account (real contact,
+                           guid returned -> can be messaged).
+      • on_rubika=False -> added to the address book but the number has no Rubika
+                           account, so it does NOT show as a Rubika contact.
+
+    rubpy exposes this as add_address_book on most builds; we map arguments by
+    inspecting the real signature (name-based) so argument ORDER never matters.
+    """
+    phone = normalize_phone(phone)
+    first_name = (first_name or "").strip() or phone
+    last_name = (last_name or "").strip()
+    fn = (getattr(client, "add_address_book", None)
+          or getattr(client, "add_contact", None)
+          or getattr(client, "addAddressBook", None))
+    if fn is None:
+        raise RuntimeError("this rubpy build has no add_address_book()/add_contact()")
+
+    res = None
+    try:
+        params = [p for p in inspect.signature(fn).parameters.keys() if p != "self"]
+    except (TypeError, ValueError):
+        params = []
+    if params and any("phone" in p.lower() for p in params):
+        kwargs = {}
+        for p in params:
+            lp = p.lower()
+            if "phone" in lp:
+                kwargs[p] = phone
+            elif "first" in lp:
+                kwargs[p] = first_name
+            elif "last" in lp:
+                kwargs[p] = last_name
+        try:
+            res = await fn(**kwargs)
+        except TypeError:
+            res = None
+    if res is None:
+        res = await _try_call(fn, [
+            lambda: ((), {"phone": phone, "first_name": first_name, "last_name": last_name}),
+            lambda: ((), {"phone_number": phone, "first_name": first_name, "last_name": last_name}),
+            lambda: ((phone, first_name, last_name), {}),
+            lambda: ((first_name, last_name, phone), {}),
+            lambda: ((phone, first_name), {}),
+            lambda: ((phone,), {}),
+        ])
+
+    # the response carries the user object (with a guid) ONLY when the number
+    # is a real Rubika account.
+    guid = _guid_of(res)
+    if not guid:
+        d = _data_of(res)
+        u = d.get("user") if isinstance(d.get("user"), dict) else None
+        if u:
+            guid = _guid_of(u)
+    return {"on_rubika": bool(guid), "guid": guid}
