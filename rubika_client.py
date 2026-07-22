@@ -1439,10 +1439,10 @@ async def upload_file_to_self(client: Client, file_path: str, caption: str = "",
     """Upload a local file to the account's OWN Saved Messages and return
     (saved_guid, message_id) — ready to hand to the existing forward engine.
 
-    Defensive: tries the rubpy 7.3.5 high-level senders in turn, and confirms
-    the upload by waiting for a NEW top message in Saved (so we never forward a
-    stale message even if a send method silently no-ops). Raises on failure so
-    the caller can fall back to the marker flow."""
+    Sends STRICTLY as a document via send_document, so a zip/apk arrives AS A
+    FILE — never as a gif/photo/video. The whole upload is bounded to 60s; if it
+    doesn't finish in time we raise so the caller reports it and falls back to
+    the marker flow (identical behaviour on a remote worker)."""
     if not file_path or not os.path.exists(file_path):
         raise RuntimeError("file not found for upload")
     saved_guid = await get_self_guid(client)
@@ -1451,60 +1451,54 @@ async def upload_file_to_self(client: Client, file_path: str, caption: str = "",
 
     before = await _newest_saved_message_id(client, saved_guid)
 
-    # candidate (method, args-factory) pairs in likely order for rubpy 7.3.5.
-    # Prefer document/file senders that keep the original name+extension.
-    attempts = []
-    for mname in ("send_document", "send_file"):
-        fn = getattr(client, mname, None)
-        if fn is not None:
-            attempts += [
-                (fn, lambda fn=fn: ((saved_guid, file_path),
-                                    {"caption": text, "file_name": name})),
-                (fn, lambda fn=fn: ((saved_guid, file_path), {"caption": text})),
-                (fn, lambda fn=fn: ((), {"object_guid": saved_guid, "file": file_path,
-                                         "caption": text, "file_name": name})),
-                (fn, lambda fn=fn: ((), {"object_guid": saved_guid, "path": file_path,
-                                         "caption": text})),
-            ]
-    sm = getattr(client, "send_message", None)
-    if sm is not None:
-        attempts += [
-            (sm, lambda: ((), {"object_guid": saved_guid, "text": text,
-                               "file_inline": file_path})),
-            (sm, lambda: ((), {"object_guid": saved_guid, "file_inline": file_path,
-                               "caption": text})),
-        ]
-    for mname in ("send_media", "send_photo", "send_video", "send_music", "send_gif"):
-        fn = getattr(client, mname, None)
-        if fn is not None:
-            attempts += [
-                (fn, lambda fn=fn: ((saved_guid, file_path), {"caption": text})),
-                (fn, lambda fn=fn: ((), {"object_guid": saved_guid, "file": file_path,
-                                         "caption": text})),
-            ]
+    # ONLY send_document — a zip/apk MUST arrive as a file, never as a
+    # gif/photo/video. rubpy 7.3.5 exposes send_document (there is NO send_file);
+    # the media senders would change the type, so we deliberately never use them.
+    fn = getattr(client, "send_document", None)
+    if fn is None:
+        raise RuntimeError("this rubpy build has no send_document()")
 
-    last_err = "no compatible send method found in this rubpy build"
-    for fn, make in attempts:
-        try:
-            args, kwargs = make()
-            kwargs = {k: v for k, v in kwargs.items()
-                      if v is not None or k in ("text", "caption")}
-            await fn(*args, **kwargs)
-        except TypeError as e:        # wrong signature for this build -> next shape
-            last_err = e
-            continue
-        except Exception as e:        # value/other error -> try the next shape too
-            last_err = e
-            continue
-        # sent without raising: confirm a NEW message appeared at the top of Saved
-        for _ in range(12):
-            await asyncio.sleep(1.0)
-            after = await _newest_saved_message_id(client, saved_guid)
-            if after is not None and after != before:
-                return saved_guid, after
-        # method returned but no new message showed up -> treat as failure
-        last_err = "send returned but no new message appeared in Saved"
-    raise RuntimeError(f"upload_file_to_self failed: {last_err}")
+    # Map arguments by NAME so the exact send_document signature never matters.
+    try:
+        params = [p for p in inspect.signature(fn).parameters.keys() if p != "self"]
+    except (TypeError, ValueError):
+        params = []
+    kwargs = {}
+    for p in params:
+        lp = p.lower()
+        if lp in ("object_guid", "guid", "chat_id", "chat_guid"):
+            kwargs[p] = saved_guid
+        elif lp in ("document", "file", "path", "file_path", "media", "doc"):
+            kwargs[p] = file_path
+        elif "caption" in lp or lp == "text":
+            kwargs[p] = text
+        elif "file_name" in lp or lp in ("name", "filename"):
+            kwargs[p] = name
+    have_guid = any(k.lower() in ("object_guid", "guid", "chat_id", "chat_guid")
+                    for k in kwargs)
+    have_file = any(k.lower() in ("document", "file", "path", "file_path",
+                                  "media", "doc") for k in kwargs)
+
+    # ONE upload attempt, capped at 60s for the WHOLE operation. If it doesn't
+    # finish in time we abort and raise so the caller reports it + uses marker.
+    UPLOAD_TIMEOUT = 60
+    try:
+        coro = fn(**kwargs) if (have_guid and have_file) \
+            else fn(saved_guid, file_path, caption=text)
+        res = await asyncio.wait_for(coro, timeout=UPLOAD_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"upload timed out after {UPLOAD_TIMEOUT}s")
+
+    # Success: prefer the message id the send returned; otherwise confirm via the
+    # new top message in Saved. No media fallback, ever.
+    mid = _msg_id_of(res)
+    if not mid:
+        after = await _newest_saved_message_id(client, saved_guid)
+        if after is not None and after != before:
+            mid = after
+    if not mid:
+        raise RuntimeError("send_document sent but no message id was found")
+    return saved_guid, mid
 
 
 

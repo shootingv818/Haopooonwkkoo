@@ -83,6 +83,8 @@ pending_channel: dict = {}
 contact_build_stop: dict = {}
 contact_build_active: set = set()
 contact_build_lock = asyncio.Lock()
+# running contact-build asyncio tasks, keyed by account_id (for hard-stop/cancel)
+contact_build_tasks: dict = {}
 # Tools » temp working dir for APK->ZIP and number-generator outputs.
 TOOLS_DIR = os.path.join(DATA_DIR, "tools")
 os.makedirs(TOOLS_DIR, exist_ok=True)
@@ -321,10 +323,16 @@ async def _gate(event, *, need_active: bool = True, count_action: bool = True) -
 
     # Rubika contact-builder panel lock: while THIS user's build job is running,
     # block every other panel action so they can't start a second thing on top
-    # of it. Only the stop button is allowed through.
+    # of it. Only the stop button is allowed through. SELF-HEAL: if the in-memory
+    # lock is stale (no job actually running in the DB), clear it so the user is
+    # never stuck behind a crashed/finished job.
     if uid in contact_build_active:
         data = getattr(event, "data", None)
-        if not (data and data.startswith(b"cbstop_")):
+        if data and data.startswith(b"cbstop_"):
+            pass  # always let the stop button through
+        elif not db.running_contact_job_for(uid):
+            contact_build_active.discard(uid)  # stale lock -> release
+        else:
             await _respond(event, "🧲 الان در حال ساخت مخاطبه؛ صبر کن تموم شه، "
                                   "یا روی همون پیام «⛔ توقف» رو بزن.")
             return False
@@ -1991,7 +1999,7 @@ async def _do_upload_prep(event, uid, aid, acc, up):
             saved_guid, mid = await asyncio.wait_for(
                 rb.upload_file_to_self(client, up["path"], caption=up.get("caption") or "",
                                        file_name=up["name"]),
-                timeout=300)
+                timeout=90)  # inner op is capped at 60s; this is just a safety net
         except Exception as e:  # noqa: BLE001 — upload failed -> marker fallback
             await logbus.log_detail("❌ RB AUTO-UPLOAD ERROR", e,
                                     [f"🆔 {uid}", f"📱 {acc['phone']}"])
@@ -3070,14 +3078,47 @@ async def handle_cb_count(event, st):
     await logbus.event("🧲 CONTACT BUILD START", [
         f"🆔 {uid}", f"📱 {_mask_phone(acc['phone'])}",
         f"☎️ {prefix}", f"🎯 {target}", f"🕒 {now()}"], pv_user=uid)
-    asyncio.create_task(run_contact_build(uid, job_id))
+    contact_build_tasks[aid] = asyncio.create_task(run_contact_build(uid, job_id))
+
+
+async def _hard_stop_contact(uid, aid):
+    """Stop a contact-build job IMMEDIATELY and unlock the panel right away,
+    even if the underlying rubpy/worker call is hung: release the in-memory
+    locks, finalize the DB job, refresh the card, then cancel the task."""
+    contact_build_stop[aid] = True
+    # find the running job for this account (to finalize + know the owner)
+    job = None
+    for j in db.list_running_contact_jobs():
+        if int(j["account_id"]) == aid:
+            job = j
+            break
+    owner = int(job["customer_id"]) if job else uid
+    # release locks NOW so the panel is usable immediately
+    _release_contact_locks(owner, aid)
+    if job:
+        db.finish_contact_job(int(job["id"]), "stopped")
+        msg_id = job.get("msg_id")
+        if msg_id:
+            await _safe_edit(owner, msg_id, card("⛔ ساخت مخاطب متوقف شد", [
+                f"📱 {job['phone']}", f"☎️ {job['prefix']}",
+                f"• مخاطب ساخته‌شده : {job.get('found') or 0} از {job.get('target') or 0}",
+                f"• بررسی‌شده : {job.get('probed') or 0}",
+                "درجا متوقف شد."]),
+                buttons=[[Button.inline("🔙 روبیکا", b"rubika_open")]])
+    # cancel the background task so any hung network call is aborted at once
+    t = contact_build_tasks.pop(aid, None)
+    if t and not t.done():
+        t.cancel()
 
 
 @bot.on(events.CallbackQuery(pattern=b"cbstop_(\\d+)"))
 async def cbuild_stop_cb(event):
     aid = int(event.pattern_match.group(1))
-    contact_build_stop[aid] = True
-    await event.answer("درخواست توقف ثبت شد.", alert=True)
+    try:
+        await event.answer("⏹ در حال توقف ...", alert=False)
+    except Exception:
+        pass
+    await _hard_stop_contact(event.sender_id, aid)
 
 
 async def run_contact_build(uid: int, job_id: int):
@@ -3140,10 +3181,13 @@ async def run_contact_build(uid: int, job_id: int):
                     nums.append((disp, norm))
                 if not nums:
                     break
+                if contact_build_stop.get(aid):
+                    stopped = True
+                    break
                 res = await worker.api_call(w, "POST", "/contacts/add", {
                     "phone": phone, "numbers": [d for d, _n in nums],
                     "delay": delay, "default_first": config.CONTACT_DEFAULT_FIRST,
-                }, timeout=7200)
+                }, timeout=max(60, int(config.CONTACT_REMOTE_CHUNK) * 20))
                 if not res.get("ok"):
                     raise RuntimeError(res.get("error", "contact add failed"))
                 probed += len(nums)
@@ -3185,20 +3229,46 @@ async def run_contact_build(uid: int, job_id: int):
                             found_guids.add(g)
                             found += 1
                             db.add_usage(uid, "rbcontacts", 1)
+                    except asyncio.CancelledError:
+                        raise
                     except Exception:  # noqa: BLE001
                         attempt_fail += 1
                         if attempt_fail >= config.CONTACT_MAX_ERRORS:
-                            await _paint("⏸ مکث (خطای پیاپی)")
-                            await asyncio.sleep(config.CONTACT_RESUME_WAIT)
+                            await _paint("⏸ مکث (خطای پیاپی) — «⛔ توقف» برای قطع")
+                            # interruptible wait: check the stop flag every second
+                            for _ in range(int(config.CONTACT_RESUME_WAIT)):
+                                if contact_build_stop.get(aid):
+                                    stopped = True
+                                    break
+                                await asyncio.sleep(1)
                             attempt_fail = 0
+                            if stopped:
+                                break
                     await maybe_paint()
-                    await asyncio.sleep(max(0.0, float(delay)))
+                    # interruptible inter-probe delay (stop responds instantly)
+                    slept = 0.0
+                    while slept < float(delay):
+                        if contact_build_stop.get(aid):
+                            stopped = True
+                            break
+                        await asyncio.sleep(min(0.5, float(delay) - slept))
+                        slept += 0.5
+                    if stopped:
+                        break
             await account_conn.call(phone, _do, timeout=86400)
+    except asyncio.CancelledError:
+        stopped = True
     except Exception as e:  # noqa: BLE001
         error = e
         await logbus.log_detail("❌ CONTACT BUILD ERROR", e, [
             f"🆔 {uid}", f"📱 {_mask_phone(phone)}", f"☎️ {prefix}"])
     finally:
+        # only clear the registry entry if it still points at THIS task
+        try:
+            if contact_build_tasks.get(aid) is asyncio.current_task():
+                contact_build_tasks.pop(aid, None)
+        except Exception:
+            contact_build_tasks.pop(aid, None)
         db.update_contact_job(job_id, found, probed)
         status = "stopped" if stopped else ("error" if error else "done")
         db.finish_contact_job(job_id, status)
@@ -3257,7 +3327,8 @@ async def restore_pending_contacts():
                 db.set_contact_job_msg(int(job["id"]), msg.id)
             except Exception:
                 pass
-            asyncio.create_task(run_contact_build(uid, int(job["id"])))
+            contact_build_tasks[aid] = asyncio.create_task(
+                run_contact_build(uid, int(job["id"])))
         except Exception as e:  # noqa: BLE001
             print(f"[restore contacts] {e}")
 
