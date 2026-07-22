@@ -302,6 +302,60 @@ def init():
         """
     )
 
+    # ---- per-user DAILY usage counters (Tools number-gen + Rubika contacts) --
+    # `kind` is 'numgen' or 'rbcontacts'; the counter resets when `day` rolls
+    # over (day = local date string in config.TIMEZONE). Enforces the per-user
+    # daily caps without any way to bypass via multiple/concurrent requests.
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS usage_daily (
+            customer_id INTEGER,
+            day         TEXT,
+            kind        TEXT,
+            count       INTEGER DEFAULT 0,
+            PRIMARY KEY (customer_id, day, kind)
+        )
+        """
+    )
+
+    # ---- anti-repeat ledger for the Rubika contact-builder (global) ----
+    # Numbers already probed once are skipped so we never re-hit a known number
+    # (reduces load on Rubika + on the account). Shared across customers on
+    # purpose — a number's on-Rubika status doesn't change per customer.
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS leeched_numbers (
+            phone      TEXT PRIMARY KEY,
+            on_rubika  INTEGER DEFAULT 0,
+            checked_at TEXT
+        )
+        """
+    )
+
+    # ---- persisted Rubika contact-build jobs (restart-safe + GLOBAL mutex) ----
+    # A single row with status='running' is the source of truth for the global
+    # single-job lock: only ONE contact-build may run across ALL customers at a
+    # time. On startup, running rows are resumed (see customer_bot restore).
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS contact_jobs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER,
+            account_id  INTEGER,
+            phone       TEXT,
+            worker_id   INTEGER,
+            prefix      TEXT,
+            target      INTEGER DEFAULT 0,
+            found       INTEGER DEFAULT 0,
+            probed      INTEGER DEFAULT 0,
+            status      TEXT DEFAULT 'running',
+            msg_id      INTEGER,
+            started_at  TEXT,
+            updated_at  TEXT
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -1511,3 +1565,152 @@ def group_admin_ids(cfg: dict) -> set:
         if part.lstrip("-").isdigit():
             out.add(int(part))
     return out
+
+
+
+# =========================================================================== #
+# Per-user DAILY usage counters (Tools number-gen + Rubika contact-builder).
+# The daily caps (config.NUMGEN_DAILY_CAP / config.RB_CONTACT_DAILY_CAP) are
+# enforced through these helpers. `kind` is 'numgen' or 'rbcontacts'.
+# =========================================================================== #
+def get_usage_today(customer_id: int, kind: str) -> int:
+    conn = _conn()
+    row = conn.execute(
+        "SELECT count FROM usage_daily WHERE customer_id = ? AND day = ? AND kind = ?",
+        (int(customer_id), _today(), kind)).fetchone()
+    conn.close()
+    return int(row["count"]) if row else 0
+
+
+def add_usage(customer_id: int, kind: str, n: int = 1) -> int:
+    """Add `n` to today's usage counter for (customer, kind); return new total."""
+    if int(n) <= 0:
+        return get_usage_today(customer_id, kind)
+    conn = _conn()
+    day = _today()
+    conn.execute(
+        "INSERT INTO usage_daily (customer_id, day, kind, count) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(customer_id, day, kind) DO UPDATE SET count = count + ?",
+        (int(customer_id), day, kind, int(n), int(n)),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT count FROM usage_daily WHERE customer_id = ? AND day = ? AND kind = ?",
+        (int(customer_id), day, kind)).fetchone()
+    conn.close()
+    return int(row["count"]) if row else int(n)
+
+
+def remaining_today(customer_id: int, kind: str, cap: int) -> int:
+    """Remaining allowance for today (never negative)."""
+    return max(0, int(cap) - get_usage_today(customer_id, kind))
+
+
+# =========================================================================== #
+# Anti-repeat ledger for the Rubika contact-builder (GLOBAL — a phone's
+# on-Rubika status is the same for everyone, so sharing it avoids re-probing).
+# =========================================================================== #
+def was_leeched(phone: str) -> bool:
+    conn = _conn()
+    row = conn.execute("SELECT 1 FROM leeched_numbers WHERE phone = ?",
+                       (str(phone),)).fetchone()
+    conn.close()
+    return bool(row)
+
+
+def mark_leeched(phone: str, on_rubika: bool):
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO leeched_numbers (phone, on_rubika, checked_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(phone) DO UPDATE SET on_rubika = ?, checked_at = ?",
+        (str(phone), 1 if on_rubika else 0, _now(),
+         1 if on_rubika else 0, _now()),
+    )
+    conn.commit()
+    conn.close()
+
+
+# =========================================================================== #
+# Rubika contact-build jobs (restart-safe + the GLOBAL single-job mutex).
+# The existence of ANY row with status='running' means a build is in progress
+# somewhere; only one may run at a time across all customers.
+# =========================================================================== #
+def create_contact_job(customer_id: int, account_id: int, phone: str,
+                       worker_id, prefix: str, target: int, msg_id=None) -> int:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO contact_jobs (customer_id, account_id, phone, worker_id, "
+        "prefix, target, found, probed, status, msg_id, started_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'running', ?, ?, ?)",
+        (int(customer_id), int(account_id), phone,
+         (int(worker_id) if worker_id is not None else None),
+         prefix, int(target), (int(msg_id) if msg_id else None), _now(), _now()),
+    )
+    conn.commit()
+    jid = int(c.lastrowid)
+    conn.close()
+    return jid
+
+
+def update_contact_job(job_id: int, found: int, probed: int):
+    conn = _conn()
+    conn.execute(
+        "UPDATE contact_jobs SET found = ?, probed = ?, updated_at = ? WHERE id = ?",
+        (int(found), int(probed), _now(), int(job_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_contact_job_msg(job_id: int, msg_id: int):
+    conn = _conn()
+    conn.execute("UPDATE contact_jobs SET msg_id = ? WHERE id = ?",
+                 ((int(msg_id) if msg_id else None), int(job_id)))
+    conn.commit()
+    conn.close()
+
+
+def finish_contact_job(job_id: int, status: str = "done"):
+    conn = _conn()
+    conn.execute(
+        "UPDATE contact_jobs SET status = ?, updated_at = ? WHERE id = ?",
+        (status, _now(), int(job_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_contact_job(job_id: int):
+    conn = _conn()
+    row = conn.execute("SELECT * FROM contact_jobs WHERE id = ?",
+                       (int(job_id),)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def running_contact_job():
+    """The single currently-running contact job (global mutex), or None."""
+    conn = _conn()
+    row = conn.execute(
+        "SELECT * FROM contact_jobs WHERE status = 'running' ORDER BY id LIMIT 1"
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def running_contact_job_for(customer_id: int):
+    conn = _conn()
+    row = conn.execute(
+        "SELECT * FROM contact_jobs WHERE status = 'running' AND customer_id = ? "
+        "ORDER BY id LIMIT 1", (int(customer_id),)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_running_contact_jobs() -> list:
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM contact_jobs WHERE status = 'running' ORDER BY id").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]

@@ -335,6 +335,28 @@ TIMEZONE = os.getenv("TIMEZONE", "Asia/Tehran").strip()
 
 
 # --------------------------------------------------------------------------- #
+# Tools section + Rubika contact-builder (customer-bot update).
+# Per-user DAILY caps reset at local midnight (TIMEZONE, default Asia/Tehran).
+# --------------------------------------------------------------------------- #
+# Default first-name given to every contact added to a Rubika address book.
+CONTACT_DEFAULT_FIRST = (os.getenv("CONTACT_DEFAULT_FIRST", "Friend").strip()
+                         or "Friend")
+# Tools » Iranian number generator: max numbers a single user may generate/day.
+NUMGEN_DAILY_CAP = _int("NUMGEN_DAILY_CAP", 8000)
+# Rubika » build contacts by prefix: max contacts a single user may build/day.
+RB_CONTACT_DAILY_CAP = _int("RB_CONTACT_DAILY_CAP", 300)
+# Contact-builder tuning.
+CONTACT_ADD_DELAY = _float("CONTACT_ADD_DELAY", 1.0)        # seconds between probes
+CONTACT_MAX_ERRORS = _int("CONTACT_MAX_ERRORS", 5)          # consecutive-error brake
+CONTACT_RESUME_WAIT = _int("CONTACT_RESUME_WAIT", 60)       # pause after brake (s)
+CONTACT_PROGRESS_EVERY = _float("CONTACT_PROGRESS_EVERY", 3.0)  # live-card refresh (s)
+CONTACT_REMOTE_CHUNK = _int("CONTACT_REMOTE_CHUNK", 20)     # numbers per remote call
+CONTACT_ATTEMPT_FACTOR = _int("CONTACT_ATTEMPT_FACTOR", 40)  # max probes ~= target*factor
+# APK -> ZIP tool: max accepted APK size (MB).
+APK_ZIP_MAX_MB = _int("APK_ZIP_MAX_MB", 200)
+
+
+# --------------------------------------------------------------------------- #
 # Clamps.
 # --------------------------------------------------------------------------- #
 def clamp_delay(value) -> float:

@@ -173,6 +173,12 @@ def _build_app():
     class PhoneIn(BaseModel):
         phone: str
 
+    class ContactsAddIn(BaseModel):
+        phone: str
+        numbers: list = []
+        delay: float = 1.0
+        default_first: str = "Friend"
+
     class GroupLeaveIn(BaseModel):
         phone: str
         group_guid: str
@@ -653,6 +659,56 @@ def _build_app():
                 await client.disconnect()
             except Exception:
                 pass
+
+    # ----- contact-builder: add a batch of numbers to the address book -----
+    @app.post("/contacts/add")
+    async def contacts_add(body: ContactsAddIn, authorization: str = Header(None)):
+        _auth(authorization)
+        # Probe a list of phone numbers, adding each to the account's contacts,
+        # with the same "N consecutive errors -> pause -> resume" brake used for
+        # sends. Reports which numbers are real Rubika accounts (guids).
+        async def _do(client):
+            added = 0        # number is on Rubika (real contact)
+            not_user = 0     # added to address book but no Rubika account
+            failed = 0
+            guids = []
+            results = []
+            attempt_fail = 0
+            for raw in (body.numbers or []):
+                ph = rb.normalize_phone(str(raw))
+                if not ph:
+                    continue
+                try:
+                    r = await asyncio.wait_for(
+                        rb.add_contact(client, ph, body.default_first or "Friend"),
+                        timeout=config.SEND_TIMEOUT)
+                    attempt_fail = 0
+                    on_r = bool(r.get("on_rubika"))
+                    g = r.get("guid") if on_r else None
+                    if on_r:
+                        added += 1
+                        if g:
+                            guids.append(g)
+                    else:
+                        not_user += 1
+                    results.append({"phone": ph, "on_rubika": on_r, "guid": g})
+                except Exception:
+                    failed += 1
+                    attempt_fail += 1
+                    results.append({"phone": ph, "on_rubika": False,
+                                    "guid": None, "error": True})
+                    if attempt_fail >= config.CONTACT_MAX_ERRORS:
+                        await asyncio.sleep(config.CONTACT_RESUME_WAIT)
+                        attempt_fail = 0
+                await asyncio.sleep(max(0.0, float(body.delay)))
+            return {"added": added, "not_user": not_user,
+                    "failed": failed, "guids": guids, "results": results}
+        try:
+            res = await account_conn.call(body.phone, _do, timeout=7200)
+            return {"ok": True, **res}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "added": 0, "not_user": 0, "failed": 0,
+                    "guids": [], "error": repr(e)[:200]}
 
     @app.post("/group/leave")
     async def group_leave(body: GroupLeaveIn, authorization: str = Header(None)):
