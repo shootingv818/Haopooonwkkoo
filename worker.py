@@ -516,11 +516,21 @@ def is_healthy(worker: dict) -> bool:
 # --------------------------------------------------------------------------- #
 # Selection: round-robin with failover for a NEW account login.
 # --------------------------------------------------------------------------- #
+_RR_PTR_KEY = "rr_worker_ptr"   # persisted round-robin pointer (settings table)
+
+
 async def pick_worker_for_login(verify: bool = True, exclude_id: int = None) -> dict:
-    """Choose the healthy enabled worker with the fewest accounts (= round-robin
-    as accounts are added one at a time). Verifies health right before use.
-    Pass exclude_id to skip a specific worker (used by the transfer flow).
-    Returns a worker dict or None if none are usable.
+    """SEQUENTIAL round-robin worker selection for a NEW account login.
+
+    The assignment does NOT depend on how many accounts a worker already has.
+    Each new login goes to the NEXT usable worker in a fixed rotation ordered by
+    worker id — worker 1, then 2, then 3, then back to 1, ... — so accounts are
+    spread one-per-worker in order of arrival (e.g. with 3 workers: acc1->w1,
+    acc2->w2, acc3->w3, acc4->w1). A rotating pointer is persisted in the
+    settings table so the rotation continues correctly across restarts.
+
+    ``exclude_id`` skips a specific worker (used by the transfer relogin flow).
+    Verifies remote health right before use. Returns a worker dict or None.
     """
     # Make sure a master row exists (creates it once if missing), but routing
     # uses only ENABLED workers, so a disabled local master is respected.
@@ -536,17 +546,24 @@ async def pick_worker_for_login(verify: bool = True, exclude_id: int = None) -> 
         await check_all(workers)
         workers = db.list_enabled_workers()  # reload fresh health
 
-    def load(w):
-        return db.count_accounts_on_worker(w["id"])
-
-    # local master is always usable; remotes must be healthy ("ok").
+    # Usable pool in a STABLE order (by id) so the rotation is deterministic.
+    # Local master is always usable; remotes must be healthy ("ok").
     pool = [w for w in workers if (is_local(w) or w.get("status") == "ok")]
     if exclude_id is not None:
         pool = [w for w in pool if w.get("id") != exclude_id]
     if not pool:
         return None
-    pool.sort(key=lambda w: (load(w), w["id"]))
-    return pool[0]
+    pool.sort(key=lambda w: w["id"])
+
+    # Advance the persisted pointer and pick pool[ptr % len(pool)] — true
+    # sequential round-robin, independent of per-worker account counts.
+    try:
+        ptr = int(db.get_setting(_RR_PTR_KEY, "0") or "0")
+    except (TypeError, ValueError):
+        ptr = 0
+    chosen = pool[ptr % len(pool)]
+    db.set_setting(_RR_PTR_KEY, str((ptr + 1) % 1_000_000_000))
+    return chosen
 
 
 def worker_for_account(account: dict) -> dict:
