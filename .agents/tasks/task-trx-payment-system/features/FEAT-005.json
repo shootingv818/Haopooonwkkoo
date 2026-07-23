@@ -1,0 +1,27 @@
+{
+  "id": "FEAT-005",
+  "type": "fix",
+  "description": "Fix v2 review issues: reorder deduct_balance before record_payment, add deposit_exists() to db.py, cap tolerance at 50%",
+  "status": "completed",
+  "steps": [
+    "In customer_bot.py plan_cb: reorder so deduct_balance is called BEFORE record_payment. If deduct fails, show error. If record_payment fails, refund via add_balance.",
+    "In customer_bot.py handle_txhash auto-purchase: same reorder as above.",
+    "In db.py: add deposit_exists(tx_hash: str) -> bool function mirroring payment_exists.",
+    "In customer_bot.py handle_txhash and handle_deposit_txhash: replace direct db._conn() calls with db.deposit_exists(tx_hash).",
+    "In owner_bot.py _handle_tolerance: cap at 50% maximum with appropriate error message."
+  ],
+  "acceptance_criteria": [
+    "deduct_balance is called BEFORE record_payment in plan_cb (balance purchase path)",
+    "deduct_balance is called BEFORE record_payment in handle_txhash (auto-purchase after deposit)",
+    "If record_payment fails after deduct, balance is refunded via add_balance",
+    "db.py has deposit_exists(tx_hash) -> bool function",
+    "No direct db._conn() calls in customer_bot.py",
+    "Tolerance handler rejects values > 50 with error message",
+    "All files pass python -m py_compile"
+  ],
+  "verification": [
+    "python -m py_compile db.py && python -m py_compile customer_bot.py && python -m py_compile owner_bot.py"
+  ],
+  "blocked_reason": null,
+  "findings": "All 3 v2 review issues fixed: (1) deduct_balance now called BEFORE record_payment in both plan_cb and handle_txhash auto-purchase paths, with add_balance refund if record_payment fails; (2) deposit_exists(tx_hash) added to db.py mirroring payment_exists, all direct db._conn() calls in customer_bot.py removed; (3) tolerance cap changed from 100% to 50% with updated error message and prompt text. All files pass py_compile."
+}

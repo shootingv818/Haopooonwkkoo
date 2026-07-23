@@ -1,0 +1,28 @@
+{
+  "id": "FEAT-004",
+  "type": "fix",
+  "description": "Fix review issues: TOCTOU race in deduct_balance, deposit ghost rows, pseudo-hash collision, TRON_API_KEY validation, minimum deposit threshold",
+  "status": "completed",
+  "steps": [
+    "Fix deduct_balance() in db.py to use atomic UPDATE...WHERE balance >= ? and check cursor.rowcount == 1",
+    "Remove optimistic insert pattern in customer_bot.py: call record_deposit AFTER verification succeeds, remove _remove_deposit and _update_deposit_amount helpers",
+    "Fix pseudo-hash collision: include uid and os.urandom in pseudo_hash, reorder so deduct_balance is called AFTER record_payment succeeds",
+    "Add TRON_API_KEY warning back to validate_customer() in config.py",
+    "Add MIN_DEPOSIT_TRX config, check minimum deposit after verification in customer_bot.py"
+  ],
+  "acceptance_criteria": [
+    "deduct_balance uses atomic UPDATE with WHERE balance >= ? guard",
+    "No deposit record inserted before verification; record_deposit called only after verification succeeds",
+    "_remove_deposit and _update_deposit_amount helpers removed",
+    "pseudo_hash includes uid and random component",
+    "deduct_balance called AFTER record_payment succeeds (not before)",
+    "validate_customer() warns about missing TRON_API_KEY",
+    "MIN_DEPOSIT_TRX config exists, deposits below threshold rejected with Persian message",
+    "All files pass python -m py_compile"
+  ],
+  "verification": [
+    "python -m py_compile db.py && python -m py_compile customer_bot.py && python -m py_compile config.py && python -m py_compile tron.py"
+  ],
+  "blocked_reason": null,
+  "findings": "All 5 review issues fixed: (1) deduct_balance now uses atomic UPDATE with WHERE balance >= ? guard and checks rowcount; (2) optimistic insert pattern removed - record_deposit called only after verification succeeds, _remove_deposit and _update_deposit_amount helpers deleted; (3) pseudo_hash uses f\"balance_{uid}_{timestamp}_{os.urandom(4).hex()}\" and deduct_balance is called after record_payment; (4) TRON_API_KEY re-added to validate_customer() as a warning; (5) MIN_DEPOSIT_TRX config added (default 1), deposits below threshold rejected with Persian message. All files pass py_compile."
+}

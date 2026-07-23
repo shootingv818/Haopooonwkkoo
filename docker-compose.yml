@@ -1,0 +1,37 @@
+# Run the owner panel and the customer bot as two separate services that share
+# the source image but keep SEPARATE databases (different MODE + same volume is
+# fine: customer.db vs central.db are different files). For a single-host test
+# both can share ./data; in production you may split them onto two hosts.
+services:
+  owner:
+    build: .
+    container_name: goao-owner
+    restart: always
+    environment:
+      - MODE=owner
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+
+  customer:
+    build: .
+    container_name: goao-customer
+    restart: always
+    environment:
+      - MODE=customer
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+
+  # A worker node is normally auto-provisioned by the owner panel; this is here
+  # only for a manual setup. Set MODE=worker + WORKER_API_TOKEN in its env.
+  # worker:
+  #   build: .
+  #   container_name: goao-worker
+  #   restart: always
+  #   network_mode: host
+  #   environment:
+  #     - MODE=worker
+  #   env_file: .env
+  #   volumes:
+  #     - ./data:/app/data

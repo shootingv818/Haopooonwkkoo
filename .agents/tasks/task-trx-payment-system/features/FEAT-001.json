@@ -1,0 +1,33 @@
+{
+  "id": "FEAT-001",
+  "type": "feat",
+  "description": "Rewrite tron.py for TRX TransferContract verification + add CoinGecko TRX price fetcher with 5-minute cache + update config.py for new TRX payment settings + update db.py schema to add balance column and new helper functions",
+  "status": "completed",
+  "steps": [
+    "In config.py: Change PLANS comments from USDT to USD (prices stay the same $5/$8/$20 but are now fixed USD prices). Remove USDT_CONTRACT, USDT_DECIMALS, PAYMENT_AMOUNT_TOLERANCE. Add PAYMENT_TOLERANCE_PERCENT = _float('PAYMENT_TOLERANCE_PERCENT', 5.0) for 5% tolerance. Add COINGECKO_CACHE_SECONDS = _int('COINGECKO_CACHE_SECONDS', 300) for 5-min price cache. Add TRX_PRICE_OVERRIDE = _float('TRX_PRICE_OVERRIDE', 0.0) for manual price override (0 means use CoinGecko). Keep WALLET_ADDRESS, TRON_API_KEY, TRONGRID_BASE, TRON_TIMEOUT. Update validate_customer() to remove USDT-specific checks.",
+    "Rewrite tron.py completely: (a) Add a get_trx_price_usd() async function that fetches TRX/USD from CoinGecko API (https://api.coingecko.com/api/v3/simple/price?ids=tron&vs_currencies=usd) with a 5-minute in-memory cache (use module-level _price_cache dict with timestamp). If config.TRX_PRICE_OVERRIDE > 0, use that instead. (b) Add calc_trx_amount(usd_price: float) -> int that divides usd_price by TRX price, rounds DOWN (math.floor) to integer (customer-friendly). (c) Rewrite verify function as verify_trx_payment(tx_hash: str, expected_trx: int) -> VerifyResult. This verifies: the tx exists (retry up to 3 times with 3s delay), contractRet==SUCCESS, contract type is 'TransferContract' (not TriggerSmartContract), destination (to_address in the contract value) matches config.WALLET_ADDRESS (compare hex forms), amount in SUN (divide by 1_000_000 to get TRX) is >= expected_trx * (1 - tolerance/100). If amount > expected_trx, still accept (overpayment accepted, only plan amount credited). Return actual TRX amount in VerifyResult. (d) Log raw TronGrid responses (status_code + truncated body) via logbus.to_group for anti-fraud audit.",
+    "In db.py: Add 'balance REAL DEFAULT 0' column to customers table (use ALTER TABLE IF NOT EXISTS pattern in init()). Add functions: get_balance(telegram_id) -> float, add_balance(telegram_id, amount: float), deduct_balance(telegram_id, amount: float) -> bool (returns False if insufficient). Add list_deposits(telegram_id) -> list for deposit history. Create a new 'deposits' table: id, customer_id, tx_hash (UNIQUE), trx_amount REAL, created_at TEXT. Add record_deposit(telegram_id, tx_hash, trx_amount) -> bool (False if hash already used). Add helper today_revenue_trx() -> float, week_revenue_trx() -> float, month_revenue_trx() -> float for owner dashboard (query payments table by date).",
+    "Update .env.example: Remove USDT_CONTRACT, USDT_DECIMALS, PAYMENT_AMOUNT_TOLERANCE. Add PAYMENT_TOLERANCE_PERCENT=5, COINGECKO_CACHE_SECONDS=300, TRX_PRICE_OVERRIDE=0. Update comments to say TRX instead of USDT."
+  ],
+  "acceptance_criteria": [
+    "tron.py has verify_trx_payment() that checks TransferContract type (not TriggerSmartContract)",
+    "tron.py has get_trx_price_usd() with 5-minute cache and CoinGecko integration",
+    "tron.py has calc_trx_amount() that rounds DOWN to integer",
+    "tron.py implements 3 retries with 3s delay when fetching transaction",
+    "tron.py logs raw TronGrid response to logbus",
+    "tron.py accepts 5% tolerance on payment amount",
+    "db.py has balance column and get_balance/add_balance/deduct_balance functions",
+    "db.py has deposits table with UNIQUE tx_hash",
+    "db.py has revenue query helpers (today/week/month)",
+    "config.py has TRX_PRICE_OVERRIDE and PAYMENT_TOLERANCE_PERCENT settings",
+    "All files pass Python syntax check (python -m py_compile)"
+  ],
+  "verification": [
+    "python -m py_compile tron.py && echo 'tron.py OK'",
+    "python -m py_compile config.py && echo 'config.py OK'",
+    "python -m py_compile db.py && echo 'db.py OK'",
+    "python -c \"import config; import db; import tron; print('imports OK')\""
+  ],
+  "blocked_reason": null,
+  "findings": "All syntax checks pass. Import checks pass with stub modules (python-dotenv, httpx not installable due to proxy restrictions but py_compile succeeds). db.init() creates all new tables correctly. Balance, deposit, settings, plan_overrides functions tested end-to-end against SQLite. Network packages (rubpy, etc.) unavailable via pip due to proxy restrictions but code is syntactically valid and imports resolve correctly."
+}

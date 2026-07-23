@@ -1,0 +1,22 @@
+# Rubika engine (verified against rubpy 7.3.5 in the previous project; pinned so
+# a freshly provisioned worker stays on the SAME method signatures as the bots).
+rubpy==7.3.5
+telethon==1.36.0
+python-dotenv==1.0.1
+# Optional but recommended for faster Telethon encryption:
+# cryptg==0.4.0
+
+# At-rest encryption (sessions + worker SSH creds/tokens).
+cryptography>=42.0.0
+# Worker provisioning + secure SSH tunnel.
+asyncssh>=2.14.0
+# HTTP client (TronGrid + master) and worker API server.
+httpx>=0.27.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
+# Timezone data for Asia/Tehran timestamps on minimal/foreign servers.
+tzdata>=2024.1
+
+# PV image -> PDF export.
+reportlab>=4.0.0
+Pillow>=10.0.0
